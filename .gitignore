@@ -1,0 +1,9 @@
+.claude-data/
+.claude/*
+!.claude/skills/
+!.claude/commands/
+.venv/
+__pycache__/
+*.pyc
+.DS_Store
+kytrack-config.md

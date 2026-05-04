@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>kytrack</title>
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+    <link rel="stylesheet" href="/static/styles.css">
+  </head>
+  <body>
+    <main id="app">
+      <section id="map" aria-label="Balloon map"></section>
+      <aside class="panel">
+        <header>
+          <h1>kytrack</h1>
+          <div id="status" class="status">connecting</div>
+        </header>
+        <label class="field">
+          Balloon
+          <select id="balloonSelect"></select>
+        </label>
+        <dl class="telemetry">
+          <div><dt>Last</dt><dd id="lastSeen">-</dd></div>
+          <div><dt>Altitude</dt><dd id="altitude">-</dd></div>
+          <div><dt>Climb</dt><dd id="climb">-</dd></div>
+          <div><dt>Speed</dt><dd id="speed">-</dd></div>
+          <div><dt>Burst</dt><dd id="burst">-</dd></div>
+          <div><dt>Landing</dt><dd id="landing">-</dd></div>
+          <div><dt>Drive</dt><dd id="drive">-</dd></div>
+        </dl>
+        <div class="settings">
+          <label class="field">
+            Burst altitude
+            <input id="burstAltitude" type="number" min="1000" max="50000" step="500" value="35000">
+          </label>
+          <label class="field">
+            Ascent m/s
+            <input id="ascentRate" type="number" min="1" max="20" step="0.5" value="5">
+          </label>
+          <label class="field">
+            Descent m/s
+            <input id="descentRate" type="number" min="1" max="30" step="0.5" value="5">
+          </label>
+        </div>
+      </aside>
+    </main>
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <script src="/static/app.js" type="module"></script>
+  </body>
+</html>
