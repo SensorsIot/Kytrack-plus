@@ -27,38 +27,11 @@ open the dashboard at `http://<pi-ip-address>:8080/` from another device.
 ## Requirements
 
 - Python 3.9 or newer.
-- A Raspberry Pi or Linux machine that can reach the balloon data feed.
+- The kytrack Raspberry Pi connected to the balloon receiver.
 - For live APRS data, `udpgate4` listening on TCP port `14580` by default.
 - Internet access from the browser for map tiles, Leaflet, SondeHub, and routing.
 
-## Install Locally
-
-Use this when you want to try the dashboard on your workstation.
-
-```bash
-git clone <repo-url> kytrack
-cd kytrack/kytrack_web
-python3 -m venv .venv
-. .venv/bin/activate
-pip install -r requirements.txt
-python -m kytrack_web.app --port 8080
-```
-
-Open:
-
-```text
-http://127.0.0.1:8080/
-```
-
-To add a manual test balloon point:
-
-```bash
-curl -X POST http://127.0.0.1:8080/api/ingest \
-  -H 'content-type: application/json' \
-  -d '{"id":"TEST","lat":47.47,"lon":7.75,"alt_m":12000,"climb_mps":5}'
-```
-
-## Install On A Raspberry Pi
+## Install On The kytrack Raspberry Pi
 
 The included service expects the app to live at `/opt/kytrack-web`.
 
