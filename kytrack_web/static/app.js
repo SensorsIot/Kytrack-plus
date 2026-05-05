@@ -21,9 +21,14 @@ const state = {
   burstMarkers: new Map(),
   predictionAscentLines: new Map(),
   predictionDescentLines: new Map(),
+  predictionCache: new Map(),
+  detectedLandings: new Map(),
   selectedId: null,
   selectedManual: false,
 };
+
+const PREDICTION_CACHE_MAX = 50;
+const STALE_THRESHOLD_MS = 3000;
 
 const els = {
   status: document.getElementById("status"),
@@ -67,12 +72,31 @@ const receiverIcon = L.divIcon({
 const worker = new Worker("/static/predictor.js");
 
 worker.onmessage = (event) => {
-  const { id, prediction } = event.data;
+  const { id, prediction, cacheKey } = event.data;
   if (!prediction) return;
+  if (cacheKey) cachePrediction(cacheKey, prediction);
   state.predictions.set(id, prediction);
   drawPrediction(id);
   renderTelemetry();
 };
+
+function predictionCacheKey(id, point) {
+  if (!point || !Number.isFinite(point.lat) || !Number.isFinite(point.lon)) return null;
+  const lat = point.lat.toFixed(2);
+  const lon = point.lon.toFixed(2);
+  const altBucket = Number.isFinite(point.alt_m) ? Math.round(point.alt_m / 100) : "x";
+  const tBucket = Math.floor(Date.now() / 300000);
+  return `${id}|${lat}|${lon}|${altBucket}|${tBucket}`;
+}
+
+function cachePrediction(key, prediction) {
+  if (state.predictionCache.has(key)) state.predictionCache.delete(key);
+  state.predictionCache.set(key, prediction);
+  while (state.predictionCache.size > PREDICTION_CACHE_MAX) {
+    const oldest = state.predictionCache.keys().next().value;
+    state.predictionCache.delete(oldest);
+  }
+}
 
 els.select.addEventListener("change", () => {
   const value = els.select.value || null;
@@ -210,11 +234,95 @@ async function fetchSondeHubTrack(id, force = false) {
     }
     state.sondeHubTracks.set(id, points);
     drawSondeHubTrack(id);
+    detectAndMarkLanding(id, points);
     requestPrediction(id);
     renderTelemetry();
   } catch {
     // Keep the local APRS track usable if SondeHub is unreachable.
   }
+}
+
+function detectAndMarkLanding(id, track) {
+  const landing = detectLandingFromTrack(track);
+  if (!landing) return;
+  state.detectedLandings.set(id, landing);
+  if (!state.landingMarkers.has(id)) {
+    state.landingMarkers.set(id, L.marker([landing.lat, landing.lon], { icon: landingIcon }).addTo(map));
+  } else {
+    state.landingMarkers.get(id).setLatLng([landing.lat, landing.lon]);
+  }
+  state.landingMarkers
+    .get(id)
+    .bindTooltip(`${id} landed (${landing.reason})`, { direction: "top", permanent: true, offset: [0, -10] });
+  applyStaleStyling(id);
+  // Freeze prediction at the detected landing — clear old prediction overlays.
+  state.predictions.delete(id);
+  for (const layerMap of [
+    state.predictionAscentLines,
+    state.predictionDescentLines,
+    state.burstMarkers,
+  ]) {
+    const layer = layerMap.get(id);
+    if (layer) {
+      map.removeLayer(layer);
+      layerMap.delete(id);
+    }
+  }
+}
+
+function detectLandingFromTrack(track) {
+  if (!Array.isArray(track) || track.length < 20) return null;
+  let peakIdx = 0;
+  for (let i = 1; i < track.length; i++) {
+    if (Number(track[i].alt_m) > Number(track[peakIdx].alt_m)) peakIdx = i;
+  }
+  if (peakIdx >= track.length - 5) return null;
+  // Blackout: gap > 20 min after peak.
+  const minGapMs = 1200 * 1000;
+  for (let i = peakIdx + 1; i < track.length - 1; i++) {
+    const gap = Date.parse(track[i + 1].received_at) - Date.parse(track[i].received_at);
+    if (Number.isFinite(gap) && gap > minGapMs) {
+      return { lat: track[i].lat, lon: track[i].lon, alt_m: track[i].alt_m, reason: "blackout" };
+    }
+  }
+  // Stationary: 20-min window after peak with low movement.
+  const minWindowMs = 1200 * 1000;
+  for (let start = peakIdx; start < track.length - 1; start++) {
+    let end = start;
+    while (
+      end < track.length - 1 &&
+      Date.parse(track[end].received_at) - Date.parse(track[start].received_at) < minWindowMs
+    ) {
+      end++;
+    }
+    if (end - start < 5) continue;
+    const window = track.slice(start, end + 1);
+    let dlat = 0;
+    let dlon = 0;
+    let dalt = 0;
+    let altSamples = 0;
+    for (let i = 1; i < window.length; i++) {
+      dlat += Math.abs(window[i].lat - window[i - 1].lat);
+      dlon += Math.abs(window[i].lon - window[i - 1].lon);
+      if (Number.isFinite(window[i].alt_m) && Number.isFinite(window[i - 1].alt_m)) {
+        dalt += Math.abs(window[i].alt_m - window[i - 1].alt_m);
+        altSamples++;
+      }
+    }
+    const n = window.length - 1;
+    const dlatMean = dlat / n;
+    const dlonMean = dlon / n;
+    const daltMean = altSamples ? dalt / altSamples : 0;
+    if (dlatMean < 0.0001 && dlonMean < 0.0001 && daltMean < 0.3) {
+      return {
+        lat: window[0].lat,
+        lon: window[0].lon,
+        alt_m: window[0].alt_m,
+        reason: "stationary",
+      };
+    }
+  }
+  return null;
 }
 
 function parseSondeHubTelemetry(id, data) {
@@ -276,7 +384,35 @@ function drawTrack(id) {
     state.markers.get(id).setLatLng([latest.lat, latest.lon]);
   }
   state.markers.get(id).bindTooltip(id, { direction: "top" });
+  applyStaleStyling(id);
 }
+
+function isTrackStale(id) {
+  const track = state.tracks.get(id) || [];
+  const latest = track[track.length - 1];
+  if (!latest) return false;
+  const t = Date.parse(latest.received_at);
+  if (!Number.isFinite(t)) return false;
+  return Date.now() - t > STALE_THRESHOLD_MS;
+}
+
+function applyStaleStyling(id) {
+  const marker = state.markers.get(id);
+  if (!marker) return;
+  const el = marker.getElement();
+  if (!el) return;
+  const dot = el.querySelector(".balloon-marker");
+  if (!dot) return;
+  const stale = isTrackStale(id);
+  const landed = state.detectedLandings.has(id);
+  dot.classList.toggle("balloon-marker-stale", stale && !landed);
+  dot.classList.toggle("balloon-marker-landed", landed);
+}
+
+setInterval(() => {
+  for (const id of state.tracks.keys()) applyStaleStyling(id);
+  if (state.selectedId) renderTelemetry();
+}, 1000);
 
 function drawPrediction(id) {
   const prediction = state.predictions.get(id);
@@ -440,20 +576,54 @@ function findBurstIndex(prediction) {
 }
 
 function requestPrediction(id) {
+  if (state.detectedLandings.has(id)) return;
   const localTrack = state.tracks.get(id) || [];
   const sondeHubTrack = state.sondeHubTracks.get(id) || [];
   const source = sondeHubTrack.length > localTrack.length ? sondeHubTrack : localTrack;
   if (source.length < 2) return;
   const track = source.slice(-50);
+  const latest = track[track.length - 1];
+  const cacheKey = predictionCacheKey(id, latest);
+  if (cacheKey && state.predictionCache.has(cacheKey)) {
+    const cached = state.predictionCache.get(cacheKey);
+    state.predictionCache.delete(cacheKey);
+    state.predictionCache.set(cacheKey, cached);
+    state.predictions.set(id, cached);
+    drawPrediction(id);
+    renderTelemetry();
+    return;
+  }
   worker.postMessage({
     id,
     track,
+    cacheKey,
     settings: {
       burstAltitude: Number(els.burstAltitude.value),
       ascentRate: Number(els.ascentRate.value),
       descentRate: Number(els.descentRate.value),
+      adjustedDescentRate: motionAdjustedDescentRate(track),
     },
   });
+}
+
+function motionAdjustedDescentRate(track) {
+  if (!Array.isArray(track) || track.length < 3) return null;
+  const now = Date.parse(track[track.length - 1].received_at);
+  if (!Number.isFinite(now)) return null;
+  const samples = [];
+  for (let i = track.length - 1; i > 0; i--) {
+    const t = Date.parse(track[i].received_at);
+    if (!Number.isFinite(t) || now - t > 60000) break;
+    const prev = track[i - 1];
+    const dt = (Date.parse(track[i].received_at) - Date.parse(prev.received_at)) / 1000;
+    if (!(dt > 0)) continue;
+    const da = Number(track[i].alt_m) - Number(prev.alt_m);
+    if (!Number.isFinite(da)) continue;
+    samples.push(da / dt);
+  }
+  if (samples.length < 3) return null;
+  samples.sort((a, b) => a - b);
+  return samples[Math.floor(samples.length / 2)];
 }
 
 function updateSelect() {

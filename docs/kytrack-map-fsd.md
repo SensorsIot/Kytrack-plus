@@ -53,6 +53,9 @@ The backend shall:
   configured launch radius (default 15 km).
 - Expose a manual refresh endpoint that triggers the site poll synchronously
   so the page can force a fresh search on load.
+- Persist the per-balloon track buffer to disk every N points (default 10) and
+  on shutdown, and reload it on startup so a service restart doesn't lose the
+  in-flight history.
 - Use low CPU and memory under normal operation.
 
 The backend shall not:
@@ -89,6 +92,30 @@ The browser app shall:
 - Feed prediction motion estimation from the SondeHub flight history when it
   is longer than the local APRS track, so a prediction renders on the very
   first ingested point instead of waiting for ≥2 local packets.
+- Smooth motion before sending it to Tawhiri: apply a Hampel outlier filter
+  (window 10, k = 3) plus an exponential moving average (τ = 10 s) to the
+  per-step horizontal and vertical rates derived from the track. Below
+  10 km altitude, use the median of the last 60 s of vertical-rate samples
+  (the *adjusted descent rate*) as Tawhiri's `descent_rate` so the predicted
+  landing tracks the balloon's actual terminal velocity instead of the
+  configured constant.
+- Cache Tawhiri responses in the browser keyed on
+  `id | lat@2dp | lon@2dp | alt/100 | 5-min bucket`, capacity 50, LRU
+  eviction. A repeated prediction for the same coarse position within the
+  same 5-minute bucket reuses the previous result instead of refiring the
+  API call.
+- Mark the balloon visually stale (grey marker, "X s/m ago" label) when the
+  latest point is more than 3 s old. A 1 Hz timer refreshes the marker class
+  and the "last seen" string.
+- Detect landing from the SondeHub flight history after the altitude peak:
+  - **Blackout**: any gap > 20 min between consecutive points → landing
+    point = last point before the gap.
+  - **Stationary**: a 20-min sliding window where the per-sample mean
+    |Δlat| and |Δlon| are < 0.0001° and the mean |Δalt| is < 0.3 m/sample
+    → landing point = window start.
+  When detected, draw the landing marker, switch the balloon icon to the
+  "landed" style, and freeze further Tawhiri prediction calls for that
+  balloon (the ground truth replaces the forecast).
 
 ## Normalized Point Schema
 
@@ -230,11 +257,20 @@ The backend keeps a separate ingest path for the configured launch site so the
 page stays useful even when the local receiver doesn't pick up the flight.
 
 - Default site: Payerne (WMO 06610), 46.8117 N / 6.9425 E.
-- Periodic poll cadence: every `--payerne-poll-interval` seconds (default
-  120 s). Also runnable on demand via `POST /api/sonde/refresh`.
+- Adaptive poll cadence based on the age of the latest ingested point:
+  - `< 2 min` old → `--payerne-poll-fresh` (default 15 s).
+  - `2–30 min` old → `--payerne-poll-stale` (default 300 s).
+  - `> 30 min` old or never seen → `--payerne-poll-idle` (default 3600 s).
+  This keeps API rate low when nothing is in the air and reacts within ~15 s
+  during an active flight.
+- Also runnable on demand via `POST /api/sonde/refresh`.
 - Step 1 — list candidates: `GET /sondes` near the site (`lat`, `lon`,
   `distance` = `--payerne-search-radius-m`, default 250 km). Sondes are
   sorted by `datetime` descending.
+- Step 1b — ground-test filter: candidates broadcasting from within
+  `--payerne-ground-test-radius-m` of their reported `uploader_position`
+  (default 1 km) are dropped. This rejects recovered/test sondes parked next
+  to a receiver from being mistaken for a flying balloon.
 - Step 2 — verify each new candidate: `GET /sondes/telemetry?serial=X` and
   check the earliest frame's distance to the site is ≤
   `--payerne-launch-radius-m` (default 15 km). Verification result is cached

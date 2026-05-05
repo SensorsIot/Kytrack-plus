@@ -57,13 +57,68 @@ function estimateMotion(track) {
   if (previous === latest) previous = usable[usable.length - 2];
   const dt = secondsBetween(previous, latest) || 60;
   const distance = haversineMeters(previous, latest);
-  const horizontalMps = distance / dt;
+  const horizontalMpsRaw = distance / dt;
   const bearing = bearingDeg(previous, latest);
-  let verticalMps = Number.isFinite(latest.climb_mps) ? latest.climb_mps : null;
-  if (verticalMps === null && Number.isFinite(previous.alt_m) && Number.isFinite(latest.alt_m)) {
-    verticalMps = (latest.alt_m - previous.alt_m) / dt;
+  let verticalMpsRaw = Number.isFinite(latest.climb_mps) ? latest.climb_mps : null;
+  if (verticalMpsRaw === null && Number.isFinite(previous.alt_m) && Number.isFinite(latest.alt_m)) {
+    verticalMpsRaw = (latest.alt_m - previous.alt_m) / dt;
   }
-  return { latest, horizontalMps, bearing, verticalMps };
+  const verticals = collectVerticalRates(usable);
+  const horizontals = collectHorizontalSpeeds(usable);
+  const verticalMps = smoothSeries(verticals, verticalMpsRaw);
+  const horizontalMps = smoothSeries(horizontals, horizontalMpsRaw);
+  return { latest, horizontalMps, bearing, verticalMps, horizontalMpsRaw, verticalMpsRaw };
+}
+
+function collectVerticalRates(track) {
+  const out = [];
+  for (let i = 1; i < track.length; i++) {
+    const dt = secondsBetween(track[i - 1], track[i]);
+    if (!dt) continue;
+    if (Number.isFinite(track[i].climb_mps)) {
+      out.push(Number(track[i].climb_mps));
+      continue;
+    }
+    if (Number.isFinite(track[i - 1].alt_m) && Number.isFinite(track[i].alt_m)) {
+      out.push((track[i].alt_m - track[i - 1].alt_m) / dt);
+    }
+  }
+  return out;
+}
+
+function collectHorizontalSpeeds(track) {
+  const out = [];
+  for (let i = 1; i < track.length; i++) {
+    const dt = secondsBetween(track[i - 1], track[i]);
+    if (!dt) continue;
+    out.push(haversineMeters(track[i - 1], track[i]) / dt);
+  }
+  return out;
+}
+
+function smoothSeries(samples, fallback) {
+  if (!samples.length) return fallback;
+  const filtered = hampel(samples.slice(-10), 3);
+  return ema(filtered, 10) ?? fallback;
+}
+
+function hampel(samples, k) {
+  if (samples.length < 3) return samples.slice();
+  const sorted = samples.slice().sort((a, b) => a - b);
+  const median = sorted[Math.floor(sorted.length / 2)];
+  const deviations = samples.map((v) => Math.abs(v - median));
+  const sortedDev = deviations.slice().sort((a, b) => a - b);
+  const mad = sortedDev[Math.floor(sortedDev.length / 2)] || 1e-6;
+  return samples.map((v) => (Math.abs(v - median) > k * 1.4826 * mad ? median : v));
+}
+
+function ema(samples, tauSeconds) {
+  if (!samples.length) return null;
+  const dt = 1;
+  const alpha = 1 - Math.exp(-dt / tauSeconds);
+  let value = samples[0];
+  for (let i = 1; i < samples.length; i++) value = alpha * samples[i] + (1 - alpha) * value;
+  return value;
 }
 
 async function predict(track, settings) {
@@ -80,8 +135,15 @@ async function predictWithTawhiri(track, settings) {
   const verticalMps = Number.isFinite(motion.verticalMps) ? motion.verticalMps : Number(latest.climb_mps) || 0;
   const ascentRate = Math.max(0.1, Math.abs(Number(settings.ascentRate) || 5));
   const settingsDescentRate = Math.max(0.1, Math.abs(Number(settings.descentRate) || 5));
+  const adjusted = Number(settings.adjustedDescentRate);
+  const live =
+    Number.isFinite(adjusted) && adjusted < 0
+      ? Math.abs(adjusted)
+      : Number.isFinite(verticalMps) && verticalMps < 0
+        ? Math.abs(verticalMps)
+        : null;
   const descentRate =
-    verticalMps < 0 && latest.alt_m < 10000 ? Math.max(0.1, Math.abs(verticalMps)) : settingsDescentRate;
+    live !== null && latest.alt_m < 10000 ? Math.max(0.1, live) : settingsDescentRate;
   const configuredBurstAltitude = Number(settings.burstAltitude) || 35000;
   const burstAltitude = verticalMps >= 0 ? Math.max(configuredBurstAltitude, latest.alt_m + 100) : latest.alt_m + 10;
   const showBurst = verticalMps >= 0;
@@ -172,6 +234,6 @@ function predictWithExtrapolation(track, settings) {
 }
 
 self.onmessage = async (event) => {
-  const { id, track, settings } = event.data;
-  self.postMessage({ id, prediction: await predict(track, settings) });
+  const { id, track, settings, cacheKey } = event.data;
+  self.postMessage({ id, prediction: await predict(track, settings), cacheKey });
 };

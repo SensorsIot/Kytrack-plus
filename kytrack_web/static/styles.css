@@ -124,6 +124,17 @@ dd {
   box-shadow: 0 1px 8px rgba(0, 0, 0, 0.4);
 }
 
+.balloon-marker-stale {
+  background: #8a8f96;
+  border-color: #e3e6ea;
+  opacity: 0.85;
+}
+
+.balloon-marker-landed {
+  background: #1f9d55;
+  border-color: #fff;
+}
+
 .landing-marker {
   width: 18px;
   height: 18px;

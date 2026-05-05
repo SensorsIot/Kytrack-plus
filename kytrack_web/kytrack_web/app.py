@@ -6,6 +6,7 @@ import contextlib
 import json
 import os
 from collections import defaultdict, deque
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
@@ -21,10 +22,26 @@ BASE_DIR = Path(__file__).resolve().parents[1]
 STATIC_DIR = BASE_DIR / "static"
 
 
+def _parse_iso_z(value: str) -> datetime:
+    if value.endswith("Z"):
+        value = value[:-1] + "+00:00"
+    return datetime.fromisoformat(value)
+
+
 class TrackStore:
-    def __init__(self, max_points: int) -> None:
+    def __init__(
+        self,
+        max_points: int,
+        persist_path: Optional[Path] = None,
+        save_every: int = 10,
+    ) -> None:
+        self._max_points = max_points
         self._tracks: dict[str, deque[dict[str, Any]]] = defaultdict(lambda: deque(maxlen=max_points))
         self._latest_at: Optional[str] = None
+        self._persist_path = persist_path
+        self._save_every = max(1, save_every)
+        self._unsaved = 0
+        self._save_lock = asyncio.Lock()
 
     @property
     def latest_at(self) -> Optional[str]:
@@ -34,10 +51,57 @@ class TrackStore:
         item = point.to_dict()
         self._tracks[point.id].append(item)
         self._latest_at = point.received_at
+        self._unsaved += 1
         return item
 
     def snapshot(self) -> dict[str, list[dict[str, Any]]]:
         return {track_id: list(points) for track_id, points in self._tracks.items()}
+
+    async def load(self) -> None:
+        if not self._persist_path or not self._persist_path.exists():
+            return
+        try:
+            data = json.loads(self._persist_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return
+        if not isinstance(data, dict):
+            return
+        tracks = data.get("tracks") if "tracks" in data else data
+        if not isinstance(tracks, dict):
+            return
+        for track_id, points in tracks.items():
+            if not isinstance(points, list):
+                continue
+            buf = deque(maxlen=self._max_points)
+            latest_at: Optional[str] = None
+            for raw in points:
+                if not isinstance(raw, dict):
+                    continue
+                buf.append(raw)
+                latest_at = raw.get("received_at") or latest_at
+            if buf:
+                self._tracks[str(track_id)] = buf
+                if latest_at and (self._latest_at is None or latest_at > self._latest_at):
+                    self._latest_at = latest_at
+
+    async def maybe_save(self, force: bool = False) -> None:
+        if not self._persist_path:
+            return
+        if not force and self._unsaved < self._save_every:
+            return
+        async with self._save_lock:
+            if not force and self._unsaved < self._save_every:
+                return
+            self._unsaved = 0
+            payload = {"tracks": self.snapshot(), "saved_at": utc_now_iso()}
+            self._persist_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self._persist_path.with_suffix(".tmp")
+            await asyncio.to_thread(
+                tmp.write_text,
+                json.dumps(payload, separators=(",", ":")),
+                "utf-8",
+            )
+            await asyncio.to_thread(tmp.replace, self._persist_path)
 
 
 class Hub:
@@ -112,8 +176,13 @@ class LandingHistoryStore:
 
 
 class AppState:
-    def __init__(self, max_points: int, landing_history_path: Path) -> None:
-        self.store = TrackStore(max_points=max_points)
+    def __init__(
+        self,
+        max_points: int,
+        landing_history_path: Path,
+        tracks_persist_path: Optional[Path] = None,
+    ) -> None:
+        self.store = TrackStore(max_points=max_points, persist_path=tracks_persist_path)
         self.landing_history = LandingHistoryStore(landing_history_path)
         self.hub = Hub()
         self.site_verified: dict[str, bool] = {}
@@ -128,6 +197,7 @@ class AppState:
     async def add_point(self, point: Point) -> None:
         item = self.store.add(point)
         await self.hub.publish({"type": "point", "point": item})
+        await self.store.maybe_save()
 
 
 async def aprs_reader(state: AppState, host: str, port: int, enabled: bool) -> None:
@@ -192,12 +262,40 @@ def _haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     return 2 * radius * asin(sqrt(a))
 
 
+def _adaptive_poll_delay(state: AppState, cfg: argparse.Namespace) -> float:
+    """Poll fast when telemetry is fresh, slow when nothing is in the air."""
+    latest = _latest_site_dt(state)
+    if not latest:
+        return cfg.payerne_poll_stale
+    try:
+        age = (datetime.now(timezone.utc) - _parse_iso_z(latest)).total_seconds()
+    except ValueError:
+        return cfg.payerne_poll_stale
+    if age < 120:
+        return cfg.payerne_poll_fresh
+    if age < 1800:
+        return cfg.payerne_poll_stale
+    return cfg.payerne_poll_idle
+
+
+def _latest_site_dt(state: AppState) -> Optional[str]:
+    latest: Optional[str] = None
+    for points in state.store.snapshot().values():
+        for pt in reversed(points):
+            if pt.get("source") == "sondehub-payerne":
+                ts = str(pt.get("received_at") or "")
+                if ts and (latest is None or ts > latest):
+                    latest = ts
+                break
+    return latest
+
+
 async def site_sonde_poller(
     state: AppState,
     session: aiohttp.ClientSession,
     cfg: argparse.Namespace,
 ) -> None:
-    if not cfg.payerne_enabled or cfg.payerne_poll_interval <= 0:
+    if not cfg.payerne_enabled:
         return
     while True:
         try:
@@ -206,8 +304,9 @@ async def site_sonde_poller(
             raise
         except Exception:
             pass
+        delay = _adaptive_poll_delay(state, cfg)
         try:
-            await asyncio.sleep(cfg.payerne_poll_interval)
+            await asyncio.sleep(delay)
         except asyncio.CancelledError:
             raise
 
@@ -238,6 +337,8 @@ async def _poll_site_once(
             dt = info.get("datetime")
             if not dt:
                 continue
+            if _is_ground_test(info, cfg):
+                continue
             candidates.append((str(dt), str(serial), info))
         candidates.sort(reverse=True)
         for dt, serial, info in candidates:
@@ -253,6 +354,30 @@ async def _poll_site_once(
             state.site_last_dt[serial] = dt
             await _ingest_site_point(state, serial, info, cfg)
             return
+
+
+def _is_ground_test(info: dict[str, Any], cfg: argparse.Namespace) -> bool:
+    """Reject sondes broadcasting from within `ground_test_radius_m` of their uploader.
+
+    Used to filter out recovered/test sondes sitting next to a receiver, which
+    would otherwise be selected as the freshest 'flying' candidate.
+    """
+    if cfg.payerne_ground_test_radius_m <= 0:
+        return False
+    upl = info.get("uploader_position")
+    if not isinstance(upl, str):
+        return False
+    parts = upl.split(",")
+    if len(parts) != 2:
+        return False
+    try:
+        upl_lat = float(parts[0])
+        upl_lon = float(parts[1])
+        sonde_lat = float(info["lat"])
+        sonde_lon = float(info["lon"])
+    except (KeyError, ValueError, TypeError):
+        return False
+    return _haversine_m(sonde_lat, sonde_lon, upl_lat, upl_lon) <= cfg.payerne_ground_test_radius_m
 
 
 async def _verify_launch_site(
@@ -459,6 +584,7 @@ async def on_startup(app: web.Application) -> None:
     cfg = app["config"]
     state = app["state"]
     await state.landing_history.load()
+    await state.store.load()
     session = aiohttp.ClientSession()
     app["http_session"] = session
     app["tasks"] = [
@@ -474,6 +600,8 @@ async def on_cleanup(app: web.Application) -> None:
         task.cancel()
     with contextlib.suppress(asyncio.TimeoutError):
         await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=3)
+    state: AppState = app["state"]
+    await state.store.maybe_save(force=True)
     session: Optional[aiohttp.ClientSession] = app.get("http_session")
     if session is not None:
         await session.close()
@@ -482,9 +610,11 @@ async def on_cleanup(app: web.Application) -> None:
 def make_app(config: argparse.Namespace) -> web.Application:
     app = web.Application()
     app["config"] = config
+    tracks_persist_path = Path(config.tracks_persist_path) if config.tracks_persist_path else None
     app["state"] = AppState(
         max_points=config.max_points,
         landing_history_path=Path(config.landing_history_path),
+        tracks_persist_path=tracks_persist_path,
     )
     app.on_startup.append(on_startup)
     app.on_cleanup.append(on_cleanup)
@@ -516,6 +646,10 @@ def parse_args() -> argparse.Namespace:
         "--landing-history-path",
         default=os.getenv("KYTRACK_LANDING_HISTORY_PATH", "/var/lib/kytrack-web/landing-history.json"),
     )
+    parser.add_argument(
+        "--tracks-persist-path",
+        default=os.getenv("KYTRACK_TRACKS_PERSIST_PATH", "/var/lib/kytrack-web/tracks.json"),
+    )
     parser.add_argument("--no-payerne", dest="payerne_enabled", action="store_false", default=True)
     parser.add_argument(
         "--payerne-lat",
@@ -528,9 +662,24 @@ def parse_args() -> argparse.Namespace:
         default=float(os.getenv("KYTRACK_PAYERNE_LON", "6.9425")),
     )
     parser.add_argument(
-        "--payerne-poll-interval",
+        "--payerne-poll-fresh",
         type=float,
-        default=float(os.getenv("KYTRACK_PAYERNE_POLL_INTERVAL", "120")),
+        default=float(os.getenv("KYTRACK_PAYERNE_POLL_FRESH", "15")),
+    )
+    parser.add_argument(
+        "--payerne-poll-stale",
+        type=float,
+        default=float(os.getenv("KYTRACK_PAYERNE_POLL_STALE", "300")),
+    )
+    parser.add_argument(
+        "--payerne-poll-idle",
+        type=float,
+        default=float(os.getenv("KYTRACK_PAYERNE_POLL_IDLE", "3600")),
+    )
+    parser.add_argument(
+        "--payerne-ground-test-radius-m",
+        type=float,
+        default=float(os.getenv("KYTRACK_PAYERNE_GROUND_TEST_RADIUS_M", "1000")),
     )
     parser.add_argument(
         "--payerne-lookback-seconds",
