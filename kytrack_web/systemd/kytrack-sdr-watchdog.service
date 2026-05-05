@@ -1,0 +1,14 @@
+[Unit]
+Description=kytrack RTL-SDR watchdog (restarts rtl_tcp when wedged)
+After=multi-user.target
+Wants=multi-user.target
+
+[Service]
+Type=simple
+User=pi
+ExecStart=/opt/kytrack-web/bin/sdr_watchdog.sh
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

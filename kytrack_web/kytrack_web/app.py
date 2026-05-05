@@ -9,10 +9,13 @@ from collections import defaultdict, deque
 from pathlib import Path
 from typing import Any, Optional
 
+import aiohttp
 from aiohttp import web
 
 from .models import Point, utc_now_iso
 from .parsers import parse_aprs_line, parse_sondemod_json
+
+SONDEHUB_API = "https://api.v2.sondehub.org"
 
 BASE_DIR = Path(__file__).resolve().parents[1]
 STATIC_DIR = BASE_DIR / "static"
@@ -113,6 +116,9 @@ class AppState:
         self.store = TrackStore(max_points=max_points)
         self.landing_history = LandingHistoryStore(landing_history_path)
         self.hub = Hub()
+        self.site_verified: dict[str, bool] = {}
+        self.site_last_dt: dict[str, str] = {}
+        self.site_poll_lock = asyncio.Lock()
         self.status: dict[str, Any] = {
             "started_at": utc_now_iso(),
             "aprs": {"connected": False, "last_line_at": None, "last_point_at": None, "errors": 0},
@@ -174,6 +180,137 @@ class JsonDatagramProtocol(asyncio.DatagramProtocol):
         if point:
             self.state.status["udp_json"]["last_point_at"] = point.received_at
             await self.state.add_point(point)
+
+
+def _haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    from math import asin, cos, radians, sin, sqrt
+
+    radius = 6371000
+    d_lat = radians(lat2 - lat1)
+    d_lon = radians(lon2 - lon1)
+    a = sin(d_lat / 2) ** 2 + cos(radians(lat1)) * cos(radians(lat2)) * sin(d_lon / 2) ** 2
+    return 2 * radius * asin(sqrt(a))
+
+
+async def site_sonde_poller(
+    state: AppState,
+    session: aiohttp.ClientSession,
+    cfg: argparse.Namespace,
+) -> None:
+    if not cfg.payerne_enabled or cfg.payerne_poll_interval <= 0:
+        return
+    while True:
+        try:
+            await _poll_site_once(state, session, cfg)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            pass
+        try:
+            await asyncio.sleep(cfg.payerne_poll_interval)
+        except asyncio.CancelledError:
+            raise
+
+
+async def _poll_site_once(
+    state: AppState,
+    session: aiohttp.ClientSession,
+    cfg: argparse.Namespace,
+) -> None:
+    async with state.site_poll_lock:
+        params = {
+            "last": str(int(cfg.payerne_lookback_seconds)),
+            "lat": f"{cfg.payerne_lat}",
+            "lon": f"{cfg.payerne_lon}",
+            "distance": str(int(cfg.payerne_search_radius_m)),
+        }
+        timeout = aiohttp.ClientTimeout(total=15)
+        async with session.get(f"{SONDEHUB_API}/sondes", params=params, timeout=timeout) as resp:
+            if resp.status != 200:
+                return
+            data = await resp.json()
+        if not isinstance(data, dict):
+            return
+        candidates: list[tuple[str, str, dict[str, Any]]] = []
+        for serial, info in data.items():
+            if not isinstance(info, dict):
+                continue
+            dt = info.get("datetime")
+            if not dt:
+                continue
+            candidates.append((str(dt), str(serial), info))
+        candidates.sort(reverse=True)
+        for dt, serial, info in candidates:
+            if state.site_verified.get(serial) is False:
+                continue
+            if serial not in state.site_verified:
+                ok = await _verify_launch_site(session, serial, cfg)
+                state.site_verified[serial] = ok
+                if not ok:
+                    continue
+            if state.site_last_dt.get(serial) == dt:
+                return
+            state.site_last_dt[serial] = dt
+            await _ingest_site_point(state, serial, info, cfg)
+            return
+
+
+async def _verify_launch_site(
+    session: aiohttp.ClientSession,
+    serial: str,
+    cfg: argparse.Namespace,
+) -> bool:
+    timeout = aiohttp.ClientTimeout(total=15)
+    params = {"serial": serial, "duration": "12h"}
+    try:
+        async with session.get(f"{SONDEHUB_API}/sondes/telemetry", params=params, timeout=timeout) as resp:
+            if resp.status != 200:
+                return False
+            data = await resp.json()
+    except Exception:
+        return False
+    serial_data = data.get(serial) if isinstance(data, dict) else None
+    if not isinstance(serial_data, dict) or not serial_data:
+        return False
+    first_key = min(serial_data)
+    first = serial_data[first_key]
+    try:
+        lat = float(first["lat"])
+        lon = float(first["lon"])
+    except (KeyError, ValueError, TypeError):
+        return False
+    return _haversine_m(lat, lon, cfg.payerne_lat, cfg.payerne_lon) <= cfg.payerne_launch_radius_m
+
+
+async def _ingest_site_point(
+    state: AppState,
+    serial: str,
+    info: dict[str, Any],
+    cfg: argparse.Namespace,
+) -> None:
+    try:
+        lat = float(info["lat"])
+        lon = float(info["lon"])
+    except (KeyError, ValueError, TypeError):
+        return
+    point = Point(
+        id=serial,
+        source="sondehub-payerne",
+        received_at=str(info.get("datetime") or utc_now_iso()),
+        lat=lat,
+        lon=lon,
+        alt_m=_optional_float(info.get("alt")),
+        climb_mps=_optional_float(info.get("vel_v")),
+        course_deg=_optional_float(info.get("heading")),
+        speed_mps=_optional_float(info.get("vel_h")),
+        meta={
+            "subtype": info.get("subtype"),
+            "frequency_mhz": _optional_float(info.get("tx_frequency") or info.get("frequency")),
+            "launch_site": cfg.payerne_site_name,
+            "uploader_callsign": info.get("uploader_callsign"),
+        },
+    )
+    await state.add_point(point)
 
 
 async def udp_json_listener(state: AppState, host: str, port: int, enabled: bool) -> None:
@@ -262,6 +399,25 @@ async def ingest(request: web.Request) -> web.Response:
     return web.json_response({"ok": True, "point": point.to_dict()})
 
 
+async def refresh_sonde(request: web.Request) -> web.Response:
+    cfg: argparse.Namespace = request.app["config"]
+    state: AppState = request.app["state"]
+    session: Optional[aiohttp.ClientSession] = request.app.get("http_session")
+    if not cfg.payerne_enabled or session is None:
+        return web.json_response({"ok": False, "error": "payerne disabled"}, status=503)
+    try:
+        await _poll_site_once(state, session, cfg)
+    except Exception:
+        pass
+    snapshot = state.store.snapshot()
+    payerne_track: Optional[dict[str, Any]] = None
+    for track_id, points in snapshot.items():
+        if points and points[-1].get("source") == "sondehub-payerne":
+            payerne_track = {"id": track_id, "points": points}
+            break
+    return web.json_response({"ok": True, "track": payerne_track})
+
+
 async def get_landing_history(request: web.Request) -> web.Response:
     state: AppState = request.app["state"]
     sonde_id = request.match_info["sonde_id"]
@@ -303,9 +459,12 @@ async def on_startup(app: web.Application) -> None:
     cfg = app["config"]
     state = app["state"]
     await state.landing_history.load()
+    session = aiohttp.ClientSession()
+    app["http_session"] = session
     app["tasks"] = [
         asyncio.create_task(aprs_reader(state, cfg.aprs_host, cfg.aprs_port, cfg.aprs_enabled)),
         asyncio.create_task(udp_json_listener(state, cfg.udp_host, cfg.udp_port, cfg.udp_enabled)),
+        asyncio.create_task(site_sonde_poller(state, session, cfg)),
     ]
 
 
@@ -315,12 +474,18 @@ async def on_cleanup(app: web.Application) -> None:
         task.cancel()
     with contextlib.suppress(asyncio.TimeoutError):
         await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=3)
+    session: Optional[aiohttp.ClientSession] = app.get("http_session")
+    if session is not None:
+        await session.close()
 
 
 def make_app(config: argparse.Namespace) -> web.Application:
     app = web.Application()
     app["config"] = config
-    app["state"] = AppState(max_points=config.max_points, landing_history_path=Path(config.landing_history_path))
+    app["state"] = AppState(
+        max_points=config.max_points,
+        landing_history_path=Path(config.landing_history_path),
+    )
     app.on_startup.append(on_startup)
     app.on_cleanup.append(on_cleanup)
 
@@ -329,6 +494,7 @@ def make_app(config: argparse.Namespace) -> web.Application:
     app.router.add_get("/api/snapshot", snapshot)
     app.router.add_get("/api/health", health)
     app.router.add_post("/api/ingest", ingest)
+    app.router.add_post("/api/sonde/refresh", refresh_sonde)
     app.router.add_get("/api/landing-history/{sonde_id}", get_landing_history)
     app.router.add_post("/api/landing-history/{sonde_id}", add_landing_history)
     app.router.add_static("/static/", STATIC_DIR, show_index=False)
@@ -349,6 +515,41 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--landing-history-path",
         default=os.getenv("KYTRACK_LANDING_HISTORY_PATH", "/var/lib/kytrack-web/landing-history.json"),
+    )
+    parser.add_argument("--no-payerne", dest="payerne_enabled", action="store_false", default=True)
+    parser.add_argument(
+        "--payerne-lat",
+        type=float,
+        default=float(os.getenv("KYTRACK_PAYERNE_LAT", "46.8117")),
+    )
+    parser.add_argument(
+        "--payerne-lon",
+        type=float,
+        default=float(os.getenv("KYTRACK_PAYERNE_LON", "6.9425")),
+    )
+    parser.add_argument(
+        "--payerne-poll-interval",
+        type=float,
+        default=float(os.getenv("KYTRACK_PAYERNE_POLL_INTERVAL", "120")),
+    )
+    parser.add_argument(
+        "--payerne-lookback-seconds",
+        type=float,
+        default=float(os.getenv("KYTRACK_PAYERNE_LOOKBACK_SECONDS", "21600")),
+    )
+    parser.add_argument(
+        "--payerne-search-radius-m",
+        type=float,
+        default=float(os.getenv("KYTRACK_PAYERNE_SEARCH_RADIUS_M", "250000")),
+    )
+    parser.add_argument(
+        "--payerne-launch-radius-m",
+        type=float,
+        default=float(os.getenv("KYTRACK_PAYERNE_LAUNCH_RADIUS_M", "15000")),
+    )
+    parser.add_argument(
+        "--payerne-site-name",
+        default=os.getenv("KYTRACK_PAYERNE_SITE_NAME", "Payerne (06610)"),
     )
     return parser.parse_args()
 

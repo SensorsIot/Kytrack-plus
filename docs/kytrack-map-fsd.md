@@ -45,6 +45,14 @@ The backend shall:
 - Keep a bounded in-memory track buffer per balloon.
 - Stream snapshots and new points to browsers using Server-Sent Events.
 - Expose a health endpoint with source status and latest packet age.
+- Periodically poll SondeHub for the newest sonde launched within a configured
+  radius of a known launch site (default Payerne, WMO 06610) and ingest its
+  current telemetry as a normalized point so the page shows the site flight
+  even when the local receiver hasn't acquired it yet. A candidate is accepted
+  only after verification that its earliest telemetry frame is within the
+  configured launch radius (default 15 km).
+- Expose a manual refresh endpoint that triggers the site poll synchronously
+  so the page can force a fresh search on load.
 - Use low CPU and memory under normal operation.
 
 The backend shall not:
@@ -72,6 +80,15 @@ The browser app shall:
   show route distance/duration.
 - Support more than one active balloon.
 - Mark stale balloons visually.
+- On page load, open the SSE stream first and then `POST /api/sonde/refresh`
+  in parallel so the freshest site sonde appears within ~1 s without waiting
+  for the next periodic poll.
+- Auto-select and pan to the balloon with the most recent received_at on
+  every update. A manual selection from the dropdown sticks until that track
+  no longer exists.
+- Feed prediction motion estimation from the SondeHub flight history when it
+  is longer than the local APRS track, so a prediction renders on the very
+  first ingested point instead of waiting for ≥2 local packets.
 
 ## Normalized Point Schema
 
@@ -199,10 +216,36 @@ that improves as real descent data arrives.
 - `GET /api/snapshot` returns current in-memory tracks.
 - `GET /api/health` returns service health.
 - `POST /api/ingest` accepts a normalized point for manual testing.
+- `POST /api/sonde/refresh` triggers an immediate SondeHub poll for the
+  configured launch site, ingests the freshest verified sonde, and returns
+  the resulting track (or `null`).
 - `GET /api/landing-history/{sonde_id}` returns persisted predicted landing
   points for one sonde.
 - `POST /api/landing-history/{sonde_id}` appends a predicted landing point for
   one sonde, deduplicating against the previous point within 25 m.
+
+## Site Sonde Polling
+
+The backend keeps a separate ingest path for the configured launch site so the
+page stays useful even when the local receiver doesn't pick up the flight.
+
+- Default site: Payerne (WMO 06610), 46.8117 N / 6.9425 E.
+- Periodic poll cadence: every `--payerne-poll-interval` seconds (default
+  120 s). Also runnable on demand via `POST /api/sonde/refresh`.
+- Step 1 — list candidates: `GET /sondes` near the site (`lat`, `lon`,
+  `distance` = `--payerne-search-radius-m`, default 250 km). Sondes are
+  sorted by `datetime` descending.
+- Step 2 — verify each new candidate: `GET /sondes/telemetry?serial=X` and
+  check the earliest frame's distance to the site is ≤
+  `--payerne-launch-radius-m` (default 15 km). Verification result is cached
+  per serial so SondeHub is queried at most once per serial.
+- Step 3 — ingest only the freshest verified Payerne sonde, deduped by
+  `datetime`. The point uses `source: "sondehub-payerne"` and the SondeHub
+  `datetime` as `received_at`. Concurrent calls (periodic + on-demand) are
+  serialised by an `asyncio.Lock`.
+
+Configurable via `--payerne-*` flags or `KYTRACK_PAYERNE_*` env vars; can be
+disabled with `--no-payerne`.
 
 ## Deployment
 
@@ -230,6 +273,57 @@ Operator URL:
 http://192.168.0.209:8080/
 ```
 
+## SDR Watchdog (kytrack-sdr-watchdog.service)
+
+A separate service running alongside `kytrack-web.service` that detects and
+recovers from a wedged `rtl_tcp`. It exists because the dxlAPRS chain has no
+internal "bytes are flowing" assertion: when `librtlsdr` fails to submit a
+USB bulk transfer at startup, `rtl_tcp`'s worker thread can die silently while
+the TCP listener stays up, so process liveness, socket liveness, and PID
+checks all show "healthy" — but `sondemod` never sees a frame.
+
+Detection signal:
+
+- Read kernel `tcp_info.bytes_sent` for each `rtl_tcp` listening port via
+  `ss -ti`, twice with a sleep in between. Healthy → ~4 MB/s. Wedged → 0.
+- This signal is **signal-independent**: an RTL-SDR streams IQ at the
+  configured rate regardless of antenna content, so the byte counter ticks
+  24/7 even when no sonde is in the air. A "no sonde decoded in N hours"
+  check would be wrong because it requires a sonde to be flying.
+- `wchar` from `/proc/<pid>/io` is *not* used; on the running platform it
+  does not reflect `rtl_tcp`'s actual send path and stays near zero on the
+  healthy SDR. `bytes_sent` from `tcp_info` is the kernel's authoritative
+  byte counter.
+
+Recovery action:
+
+- Capture the wedged `rtl_tcp`'s argv via `ps -o args=`.
+- `kill -INT` then `kill -KILL` the wedged PID.
+- Re-issue the same argv into the existing dxlAPRS screen window via
+  `screen -S <session> -p rtl_tcp -X stuff "<argv>\n"`. `sdrtst` reconnects
+  to the new listener automatically.
+
+Operating envelope:
+
+- Watches every `rtl_tcp` listening port (default: 1234 → SDR-0/`dxl`,
+  1235 → SDR-1/`dxl_sdr2`).
+- Loop interval: `INTERVAL` (default 30 s).
+- Wedge threshold: `MIN_BYTES` (default 1 000 000 B over the interval; healthy
+  is ~125 MB).
+- Post-restart grace: `GRACE` (default 60 s) so a slow respawn doesn't get
+  re-killed.
+- Each watched SDR is independent: restarting one does not perturb the other.
+- Runs as user `pi` so it can address the existing user-owned screen sessions.
+
+Acceptance criteria:
+
+- When either `rtl_tcp` shows zero TCP throughput for ≥ `INTERVAL`, the
+  watchdog logs the wedge to journald, kills the process, and re-issues its
+  argv to the matching screen window.
+- After respawn, `bytes_sent` resumes at ~4 MB/s and `sondemod` decodes
+  frames again on that frequency.
+- The other (healthy) SDR is untouched throughout.
+
 ## Acceptance Criteria
 
 - The web app loads from the Pi.
@@ -238,3 +332,7 @@ http://192.168.0.209:8080/
 - Browser CPU handles map and prediction updates; backend CPU remains low.
 - `/api/health` reports whether APRS and UDP sources are active.
 - Restarting the web service does not affect dxlAPRS decoding or APRS-IS upload.
+- On page load, the freshest sonde launched from the configured site appears
+  within a few seconds even before the periodic poll cycle elapses.
+- A wedged `rtl_tcp` is detected and respawned automatically within
+  `INTERVAL + GRACE` seconds without operator intervention.

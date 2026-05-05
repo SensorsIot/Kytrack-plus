@@ -22,6 +22,7 @@ const state = {
   predictionAscentLines: new Map(),
   predictionDescentLines: new Map(),
   selectedId: null,
+  selectedManual: false,
 };
 
 const els = {
@@ -74,7 +75,10 @@ worker.onmessage = (event) => {
 };
 
 els.select.addEventListener("change", () => {
-  state.selectedId = els.select.value || null;
+  const value = els.select.value || null;
+  state.selectedId = value;
+  state.selectedManual = !!value;
+  if (value) panToTrack(value);
   renderTelemetry();
 });
 
@@ -84,7 +88,16 @@ for (const input of [els.burstAltitude, els.ascentRate, els.descentRate]) {
   });
 }
 
-connectEvents();
+bootstrap();
+
+async function bootstrap() {
+  connectEvents();
+  try {
+    await fetch("/api/sonde/refresh", { method: "POST", cache: "no-store" });
+  } catch {
+    // SSE will deliver the sonde when the next poll cycle finishes.
+  }
+}
 
 function connectEvents() {
   const events = new EventSource("/events");
@@ -115,18 +128,50 @@ function addPoint(point, shouldFit) {
     return;
   }
 
-  if (!state.tracks.has(point.id)) state.tracks.set(point.id, []);
+  const isNewTrack = !state.tracks.has(point.id);
+  if (isNewTrack) state.tracks.set(point.id, []);
   const track = state.tracks.get(point.id);
   track.push(point);
   if (track.length > 300) track.shift();
-  if (!state.selectedId) state.selectedId = point.id;
   drawTrack(point.id);
   fetchSondeHubTrack(point.id);
   loadLandingHistory(point.id);
-  updateSelect();
   requestPrediction(point.id);
+  autoSelectFreshest({ pan: isNewTrack });
+  updateSelect();
   renderTelemetry();
   if (shouldFit && track.length === 1) fitIfNeeded();
+}
+
+function freshestTrackId() {
+  let bestId = null;
+  let bestTime = -Infinity;
+  for (const [id, track] of state.tracks) {
+    const last = track[track.length - 1];
+    if (!last) continue;
+    const t = Date.parse(last.received_at);
+    if (Number.isFinite(t) && t > bestTime) {
+      bestTime = t;
+      bestId = id;
+    }
+  }
+  return bestId;
+}
+
+function autoSelectFreshest({ pan = false } = {}) {
+  if (state.selectedManual && state.selectedId && state.tracks.has(state.selectedId)) return;
+  const freshest = freshestTrackId();
+  if (!freshest || freshest === state.selectedId) return;
+  state.selectedId = freshest;
+  state.selectedManual = false;
+  if (pan) panToTrack(freshest);
+}
+
+function panToTrack(id) {
+  const track = state.tracks.get(id) || [];
+  const last = track[track.length - 1];
+  if (!last) return;
+  map.panTo([last.lat, last.lon]);
 }
 
 function drawReceiver(point) {
@@ -165,6 +210,7 @@ async function fetchSondeHubTrack(id, force = false) {
     }
     state.sondeHubTracks.set(id, points);
     drawSondeHubTrack(id);
+    requestPrediction(id);
     renderTelemetry();
   } catch {
     // Keep the local APRS track usable if SondeHub is unreachable.
@@ -394,8 +440,11 @@ function findBurstIndex(prediction) {
 }
 
 function requestPrediction(id) {
-  const track = state.tracks.get(id);
-  if (!track || track.length < 2) return;
+  const localTrack = state.tracks.get(id) || [];
+  const sondeHubTrack = state.sondeHubTracks.get(id) || [];
+  const source = sondeHubTrack.length > localTrack.length ? sondeHubTrack : localTrack;
+  if (source.length < 2) return;
+  const track = source.slice(-50);
   worker.postMessage({
     id,
     track,
