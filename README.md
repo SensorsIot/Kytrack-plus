@@ -58,12 +58,6 @@ Then open the Pi from another device on the same network:
 http://<pi-ip-address>:8080/
 ```
 
-For this kytrack appliance, the usual address is:
-
-```text
-http://192.168.0.209:8080/
-```
-
 ## Data Feeds
 
 By default, kytrack connects to APRS data at:
