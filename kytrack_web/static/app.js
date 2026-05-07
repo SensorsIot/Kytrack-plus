@@ -371,6 +371,7 @@ const LiveMode = {
     track.push(point);
     if (track.length > 300) track.shift();
     this.drawTrack(point.id);
+    this.drawSondeHubTrack(point.id);
     this.fetchSondeHubTrack(point.id);
     this.requestPrediction(point.id);
     this.autoSelectFreshest({ pan: isNewTrack });
@@ -489,8 +490,22 @@ const LiveMode = {
     this.applyStaleStyling(id);
   },
 
+  travelledTrack(id) {
+    const sondeHub = this.sondeHubTracks.get(id) || [];
+    const local = this.tracks.get(id) || [];
+    if (!sondeHub.length) return local;
+    if (!local.length) return sondeHub;
+    const tail = Date.parse(sondeHub[sondeHub.length - 1].received_at);
+    if (!Number.isFinite(tail)) return sondeHub;
+    const extension = local.filter((p) => {
+      const t = Date.parse(p.received_at);
+      return Number.isFinite(t) && t > tail;
+    });
+    return extension.length ? sondeHub.concat(extension) : sondeHub;
+  },
+
   drawSondeHubTrack(id) {
-    const track = this.sondeHubTracks.get(id) || [];
+    const track = this.travelledTrack(id);
     const latlngs = track.map((p) => [p.lat, p.lon]);
     if (!latlngs.length) return;
     if (!this.sondeHubPolylines.has(id)) {
