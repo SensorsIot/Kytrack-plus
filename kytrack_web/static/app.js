@@ -297,6 +297,7 @@ const LiveMode = {
   lastSeenMarkers: new Map(),
   routeLines: new Map(),
   landingHistoryLines: new Map(),
+  landingHistoryDots: new Map(),
 
   predictions: new Map(),
   routeMetrics: new Map(),
@@ -703,19 +704,37 @@ const LiveMode = {
 
   drawLandingHistory(id) {
     const history = this.landingHistory.get(id) || [];
+    if (this.landingHistoryDots.has(id)) {
+      map.removeLayer(this.landingHistoryDots.get(id));
+      this.landingHistoryDots.delete(id);
+    }
     if (history.length < 2) {
       if (this.landingHistoryLines.has(id)) {
         map.removeLayer(this.landingHistoryLines.get(id));
         this.landingHistoryLines.delete(id);
       }
-      return;
+    } else {
+      const latlngs = history.map((p) => [p.lat, p.lon]);
+      setPolyline(this.landingHistoryLines, id, latlngs, {
+        color: "#8f3ffc",
+        weight: 4,
+        opacity: 0.9,
+      });
     }
-    const latlngs = history.map((p) => [p.lat, p.lon]);
-    setPolyline(this.landingHistoryLines, id, latlngs, {
-      color: "#8f3ffc",
-      weight: 4,
-      opacity: 0.9,
-    });
+    if (history.length) {
+      const dots = L.layerGroup(
+        history.map((p) =>
+          L.circleMarker([p.lat, p.lon], {
+            radius: 3,
+            color: "#8f3ffc",
+            weight: 1,
+            fillColor: "#8f3ffc",
+            fillOpacity: 1,
+          }),
+        ),
+      ).addTo(map);
+      this.landingHistoryDots.set(id, dots);
+    }
   },
 
   freshestTrackId() {
@@ -771,6 +790,7 @@ const LiveMode = {
       this.lastSeenMarkers,
       this.routeLines,
       this.landingHistoryLines,
+      this.landingHistoryDots,
     ]) {
       for (const layer of layerMap.values()) map.removeLayer(layer);
       layerMap.clear();
