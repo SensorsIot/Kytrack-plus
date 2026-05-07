@@ -388,6 +388,7 @@ const LiveMode = {
 
   onPrediction({ id, prediction, cacheKey }) {
     if (activeMode !== this) return;
+    if (id !== this.serial) return;
     if (!prediction) return;
     if (cacheKey) this.cachePrediction(cacheKey, prediction);
     this.predictions.set(id, prediction);
@@ -655,13 +656,14 @@ const LiveMode = {
   },
 
   async loadLandingHistory(id) {
+    if (id !== this.serial) return;
     if (this.landingHistoryFetches.get(id)) return;
     this.landingHistoryFetches.set(id, true);
     try {
       const response = await fetch(`/api/landing-history/${encodeURIComponent(id)}`, { cache: "no-store" });
       if (!response.ok) return;
       const data = await response.json();
-      if (activeMode !== this) return;
+      if (activeMode !== this || id !== this.serial) return;
       const points = Array.isArray(data?.points) ? data.points : [];
       this.landingHistory.set(id, points);
       this.drawLandingHistory(id);
@@ -671,11 +673,13 @@ const LiveMode = {
   },
 
   applyLandingHistory(id, points) {
+    if (id !== this.serial) return;
     this.landingHistory.set(id, Array.isArray(points) ? points : []);
     this.drawLandingHistory(id);
   },
 
   async recordLanding(id, prediction) {
+    if (id !== this.serial) return;
     const landing = prediction?.landing;
     if (!landing || !Number.isFinite(landing.lat) || !Number.isFinite(landing.lon)) return;
     const last = this.lastPostedLanding.get(id);
@@ -694,7 +698,7 @@ const LiveMode = {
       });
       if (!response.ok) return;
       const data = await response.json();
-      if (activeMode !== this) return;
+      if (activeMode !== this || id !== this.serial) return;
       this.applyLandingHistory(id, data?.points);
     } catch {
       // Server publishes a landing_history SSE event on success; failures here
