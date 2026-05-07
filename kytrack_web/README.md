@@ -7,12 +7,23 @@ map.
 
 - Reads the local dxlAPRS/APRS TCP stream from `udpgate4`.
 - Shows the kytrack receiver as an `RX` marker.
-- Shows active sondes by sonde number.
+- Shows the active Payerne sonde by serial number.
 - Fetches the travelled sonde path from SondeHub and draws it in red.
-- Calls SondeHub Tawhiri directly from the browser for prediction.
-- Draws prediction in green and predicted landing-point history in purple.
-- Draws a car route from receiver to predicted landing and shows distance/time.
-- Persists predicted landing-point history per sonde on the Pi.
+- Calls SondeHub Tawhiri directly from the browser for prediction; the
+  predicted landing pin (yellow) extrapolates past the last received fix
+  to the actual touchdown.
+- Draws a hollow-ring **last-seen** pin where SondeHub telemetry stops
+  (blackout or stationary detection), distinct from the predicted landing.
+- Draws a car route from receiver to predicted landing and shows distance
+  and duration in the **Drive** field.
+- Pre-flight Payerne forecast in the no-flight state with the same drive
+  metric; `11:00 UTC` / `23:00 UTC` slots are user-selectable from the
+  **Balloon** dropdown.
+- Persists predicted-landing snapshots per sonde on the Pi
+  (`/var/lib/kytrack-web/landing-history.json`), de-duplicated at 100 m.
+- Frontend is split into shared scaffolding plus `LiveMode` and
+  `ForecastMode` objects with a small dispatcher that swaps modes based
+  on the SondeHub Payerne probe.
 
 ## Run Locally
 

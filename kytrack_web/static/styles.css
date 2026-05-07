@@ -143,6 +143,15 @@ dd {
   background: #f2c94c;
 }
 
+.last-seen-marker {
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  border: 2px solid #1f2933;
+  background: transparent;
+  box-shadow: inset 0 0 0 3px #ffffff;
+}
+
 .burst-marker {
   width: 30px;
   height: 30px;
@@ -162,6 +171,15 @@ dd {
   background: #fff7e8;
   color: #111827;
   font-weight: 700;
+}
+
+.forecast-launch-marker {
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  border: 3px dashed #6b7280;
+  background: #e5e7eb;
+  box-shadow: 0 1px 6px rgba(0, 0, 0, 0.25);
 }
 
 .receiver-marker {

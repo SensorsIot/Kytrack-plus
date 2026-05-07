@@ -107,15 +107,35 @@ The browser app shall:
 - Mark the balloon visually stale (grey marker, "X s/m ago" label) when the
   latest point is more than 3 s old. A 1 Hz timer refreshes the marker class
   and the "last seen" string.
-- Detect landing from the SondeHub flight history after the altitude peak:
-  - **Blackout**: any gap > 20 min between consecutive points → landing
+- Detect a **last-seen** point on the SondeHub flight history once the
+  altitude peak is past — radiosondes typically lose telemetry above ground
+  level, so the last received fix is not the actual landing.
+  - **Blackout**: any gap > 20 min between consecutive points → last-seen
     point = last point before the gap.
   - **Stationary**: a 20-min sliding window where the per-sample mean
     |Δlat| and |Δlon| are < 0.0001° and the mean |Δalt| is < 0.3 m/sample
-    → landing point = window start.
-  When detected, draw the landing marker, switch the balloon icon to the
-  "landed" style, and freeze further Tawhiri prediction calls for that
-  balloon (the ground truth replaces the forecast).
+    → last-seen point = window start.
+  When detected, draw a hollow-ring **last-seen marker** at that point and
+  switch the balloon icon to the post-flight style. **Continue** running
+  Tawhiri so the predicted landing (yellow pin) extrapolates from the
+  last-seen point to ground, and the OSRM driving route follows the
+  predicted landing — not the last-seen point.
+- Hide the live telemetry rows (Last, Altitude, Climb, Speed, Burst,
+  Landing) when no live track is selected, leaving only the Drive metric
+  visible. This keeps the side panel relevant in the no-flight state and
+  during initial bootstrap.
+- Maintain a **flying / no-flight** state (see "No-Flight State"). In the
+  no-flight state, suppress every live-balloon overlay and render only the
+  pre-flight forecast and its car route.
+- Implement the two states as **`LiveMode`** and **`ForecastMode`** objects
+  with a shared `enter / exit / refresh / onPoint / onSelect / onPrediction
+  / onReceiverUpdate / onSettingsChanged / render` lifecycle. A small
+  dispatcher swaps the active mode based on the Payerne probe result;
+  every mode-specific Map / Set / interval lives on the mode object so a
+  transition fully cleans up its overlays and timers. SSE points, worker
+  prediction replies, dropdown changes, and settings changes are routed
+  through the active mode, with each async fetch handler ignoring its own
+  reply if the active mode has changed in the meantime.
 
 ## Normalized Point Schema
 
@@ -192,6 +212,57 @@ SondeHub's Tawhiri endpoint. The backend still does not compute predictions.
 - If Tawhiri is unavailable, the browser may temporarily fall back to a simple
   local extrapolation so the map remains usable.
 
+### Pre-flight Forecast
+
+When the browser is in the no-flight state (see "No-Flight State"), it
+requests a single Tawhiri prediction for the next scheduled Payerne launch
+slot. No real track is required.
+
+- Slot times: 11:00 UTC and 23:00 UTC. The browser picks the earliest slot
+  whose UTC time is strictly in the future; if both have passed today, it
+  picks 11:00 UTC tomorrow.
+- Tawhiri request fields:
+  - `launch_latitude`: 46.8117
+  - `launch_longitude`: 6.9425
+  - `launch_altitude`: 491 m
+  - `launch_datetime`: next slot in UTC.
+  - `ascent_rate`, `burst_altitude`, `descent_rate`: from the configured
+    prediction settings. The adjusted-descent-rate path does not apply
+    because no live telemetry exists.
+  - `profile`: `standard_profile`.
+  - `format`: `json`.
+- Rendering:
+  - Predicted path drawn as a **dashed grey** polyline, visually distinct
+    from the live solid green prediction polyline.
+  - Launch marker at Payerne with tooltip
+    `Payerne forecast — launch HH:00 UTC`.
+  - Burst marker at the predicted burst point. The pre-flight balloon is
+    by definition ascending (it has not launched yet), so the burst marker
+    is always shown for the forecast.
+  - Landing marker at the predicted landing point with tooltip
+    `Forecast landing HH:MM UTC`, where `HH:MM` is the **predicted
+    touchdown** time (taken from the last point of Tawhiri's descent
+    trajectory), not the launch slot.
+  - No SondeHub track is drawn (no telemetry exists). No landing-history
+    line.
+- Refresh triggers:
+  - On entering the no-flight state.
+  - Each minute, if the previously requested slot is in the past, request
+    the next slot.
+  - When the user changes any of `ascent_rate`, `burst_altitude`, or
+    `descent_rate` while in the no-flight state.
+  - When the user picks a slot from the **Balloon** dropdown (see below).
+- Slot picker: in the no-flight state the Balloon dropdown offers two
+  options — `11:00 UTC` and `23:00 UTC` — pre-selecting whichever matches
+  the currently rendered forecast (defaults to the upcoming slot).
+  Selecting the other re-runs Tawhiri for **today's** instance of that
+  hour, regardless of whether the hour has already passed today, and
+  redraws the trajectory, landing pin, and driving route. The dropdown
+  reverts to listing live sonde IDs as soon as a flight starts.
+- The OSRM car route from the receiver marker to the predicted landing
+  point is drawn the same way as in the live case, and its driving
+  distance and duration appear in the side panel's **Drive** field.
+
 ## Travelled Track History
 
 The browser fetches SondeHub telemetry history for each active sonde:
@@ -210,28 +281,107 @@ The response is parsed as `{ serial: { timestamp: telemetry_point } }`.
   separate local receiver track polyline is drawn.
 - Fetch cadence is at most once per sonde per 60 seconds.
 - The prediction path is drawn as a prominent solid green polyline.
-- Landing point history is recorded from prediction updates, persisted on the
-  Pi keyed by sonde number, and drawn as a purple polyline. New landing points
-  are deduplicated when within 25 m of the previous landing point.
-- Persistence file: `/var/lib/kytrack-web/landing-history.json`.
-- API:
-  - `GET /api/landing-history/{sonde_id}`
-  - `POST /api/landing-history/{sonde_id}`
+- Only the **current** predicted landing point is shown (yellow marker).
+  No history of past predicted landing points is rendered or persisted on
+  the frontend; the visual clutter from a long-running flight's drifting
+  prediction was not informative. The backend's
+  `/api/landing-history/{sonde_id}` endpoints remain available for
+  external use but are no longer exercised by this app.
+
+## No-Flight State
+
+The browser determines flight state by querying SondeHub directly — see
+"Payerne Probe" below. The backend snapshot is not used for this decision,
+because it includes persisted tracks from past flights that would
+incorrectly read as "flying."
+
+- **Flying**: the SondeHub probe returns a verified Payerne sonde serial.
+- **No-flight**: the probe returns `null` (no Payerne sonde is reporting
+  telemetry within the search radius).
+
+In the no-flight state the browser hides every live-balloon overlay —
+balloon markers, SondeHub red track polylines, predicted ascent/descent
+polylines, burst markers, predicted landing markers, predicted-landing
+history (purple) polylines, and the OSRM car route to those landings — and
+shows only the pre-flight forecast (see "Pre-flight Forecast" under
+"Landing Forecast V1") together with its car route.
+
+Transitions:
+
+- On the probe returning a serial for the first time (or a different
+  serial): clear any pre-flight forecast and render the live overlays for
+  that serial.
+- On the probe returning `null`: clear the live overlays and show the
+  pre-flight forecast for the next slot.
+
+Non-Payerne sondes — whether received via local APRS, SondeHub history, or
+the backend SSE feed — are never rendered on this map. Only points whose
+`id` matches the currently verified Payerne serial are accepted.
+
+## Payerne Probe
+
+The browser determines the currently flying Payerne sonde by querying
+SondeHub directly with a single per-site request. The probe runs on page
+load and every `PAYERNE_PROBE_INTERVAL_MS` (default 60 s).
+
+- Single call:
+  `GET https://api.v2.sondehub.org/sondes/site/06610`.
+  Payerne's WMO station ID is `06610`. The response is a map of
+  `{ serial: latest_telemetry_frame }` for sondes that SondeHub
+  associates with that site. No coordinate filtering, no distance check,
+  and no separate launch-site verification step are needed — the site
+  endpoint already does the launch-site grouping for us.
+- Pick the entry with the freshest `datetime`.
+- If the freshest entry's `datetime` is within the last
+  `PAYERNE_FRESH_MS` (default 30 min), return that serial. Otherwise
+  return `null` — the response can include sondes from previous flights
+  that have already landed, so a recency check is required to distinguish
+  "currently flying" from "landed earlier today."
+
+By deciding flight state from this fresh SondeHub query rather than from
+the backend's persisted snapshot, the page is unaffected by stale
+historical tracks left over from previous flights.
+
+### Live updates vs. SondeHub fill-in
+
+For a flying balloon, position updates flow from the SSE stream emitted
+by the kytrack backend (local APRS via `udpgate4` and the backend's own
+Payerne poller). The frontend updates the balloon marker on every SSE
+`point` event whose `id` matches the verified Payerne serial.
+
+SondeHub `/sondes/telemetry?serial=<X>&duration=3d` is used only as a
+fill-in:
+
+- **Initial seed**: when a new Payerne serial is first identified, the
+  full SondeHub flight history is fetched once to seed the track and
+  prediction.
+- **Gap recovery**: on each periodic probe, if the latest SSE point in
+  `state.tracks` is more than 120 s old, the SondeHub history is
+  re-fetched to fill any gap. While SSE is delivering points (latest
+  point ≤ 120 s old), the probe does not touch the per-sonde SondeHub
+  endpoint.
+
+The launch site coordinates used by the Pre-flight Forecast (lat
+46.8117 N, lon 6.9425 E, alt 491 m) are the canonical position of WMO
+station `06610` and match SondeHub's `/sites` registry entry for Payerne.
 
 ## Car Route Overlay
 
-The browser draws the driving route from the local receiver marker to the latest
-predicted landing point.
+The browser draws the driving route from the local receiver marker to the
+latest predicted landing point. This applies both to live predictions for a
+flying balloon and to the pre-flight forecast in the no-flight state.
 
 - Route source: OSRM public demo route endpoint.
 - Profile: car/driving.
 - Route is fetched directly by the browser.
 - The Pi backend does not calculate routing.
-- Route is refreshed when the receiver position or predicted landing point
-  changes.
+- Route is re-fetched on every new prediction tick, so a moving predicted
+  landing always has a matching driving line. It is also re-fetched when
+  the receiver position changes.
 - The route is drawn as a prominent solid dark polyline.
-- Driving distance and estimated duration are shown in the side panel for the
-  selected sonde.
+- Driving distance and estimated duration are shown in the side panel's
+  **Drive** field for both the selected live sonde and the no-flight
+  forecast.
 
 The result is not a meteorological model. It is a live operational estimate
 that improves as real descent data arrives.
@@ -249,7 +399,7 @@ that improves as real descent data arrives.
 - `GET /api/landing-history/{sonde_id}` returns persisted predicted landing
   points for one sonde.
 - `POST /api/landing-history/{sonde_id}` appends a predicted landing point for
-  one sonde, deduplicating against the previous point within 25 m.
+  one sonde, deduplicating against the previous point within 100 m.
 
 ## Site Sonde Polling
 
@@ -372,3 +522,20 @@ Acceptance criteria:
   within a few seconds even before the periodic poll cycle elapses.
 - A wedged `rtl_tcp` is detected and respawned automatically within
   `INTERVAL + GRACE` seconds without operator intervention.
+- When no Payerne sonde has been ingested, the map shows only the
+  pre-flight forecast (dashed grey trajectory from Payerne to the predicted
+  landing point) and the OSRM car route from the receiver to that landing.
+  No other balloon overlays are visible.
+- As soon as the Payerne poller ingests its first `sondehub-payerne` point,
+  the pre-flight forecast disappears and is replaced by the live SondeHub
+  red track, the green live prediction, the predicted landing marker, and
+  the car route for that flight.
+- During descent, when the SondeHub flight history goes stationary or
+  blacks out, a hollow-ring last-seen marker appears at the last fix while
+  the green descent line and the yellow landing pin continue to the
+  predicted touchdown. The black driving line ends at the yellow landing
+  pin, not at the last-seen marker.
+- In the no-flight state the **Balloon** dropdown offers `11:00 UTC` and
+  `23:00 UTC`; selecting either re-runs the Tawhiri forecast for today's
+  instance of that hour and the new trajectory, landing pin, and driving
+  metric appear within a few seconds.

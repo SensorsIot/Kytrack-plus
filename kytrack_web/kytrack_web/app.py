@@ -161,7 +161,7 @@ class LandingHistoryStore:
         }
         async with self._lock:
             points = self._items.setdefault(sonde_id, [])
-            if points and distance_m(points[-1], normalized) < 25:
+            if points and distance_m(points[-1], normalized) < 100:
                 return list(points)
             points.append(normalized)
             del points[:-self.max_points]

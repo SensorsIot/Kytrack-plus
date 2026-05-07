@@ -7,8 +7,12 @@ Raspberry Pi receiver.
 
 It turns the Pi's local APRS or sondemod feed into a live web dashboard you can
 open from a phone, tablet, or laptop while chasing a balloon. The map shows the
-receiver, active balloons, travelled track, predicted flight path, predicted
-landing history, and driving route to the current predicted landing point.
+receiver, the active balloon, its travelled track, the predicted flight path,
+the predicted landing point, and the driving route from the receiver to that
+landing. When no flight is in progress, it instead shows a pre-flight forecast
+for the next Payerne launch slot (selectable between `11:00 UTC` and
+`23:00 UTC` from the **Balloon** dropdown) so you can plan a chase before
+launch.
 
 Most users will run kytrack on the Raspberry Pi connected to the receiver, then
 open the dashboard at `http://<pi-ip-address>:8080/` from another device.
@@ -20,8 +24,15 @@ open the dashboard at `http://<pi-ip-address>:8080/` from another device.
 - A browser map with balloon selection, altitude, climb, speed, burst estimate,
   landing estimate, and drive distance/time.
 - SondeHub path lookup for the travelled balloon track.
-- Browser-side Tawhiri prediction through SondeHub.
-- Saved predicted landing history per balloon.
+- Browser-side Tawhiri prediction through SondeHub, refreshed for every new
+  fix and continued past the last received telemetry until ground level.
+- A separate **last-seen** marker (hollow ring) at the last received fix —
+  radiosondes typically lose telemetry well above ground, so the predicted
+  landing pin marks the actual touchdown, not the last reported position.
+- Pre-flight Payerne forecast (`11:00 UTC` / `23:00 UTC` slots) with full
+  trajectory and driving route when no balloon is in the air.
+- Backend log of every predicted landing per sonde (de-duplicated at 100 m)
+  in `/var/lib/kytrack-web/landing-history.json`.
 - A systemd service for running the web app on a Raspberry Pi.
 
 ## Requirements

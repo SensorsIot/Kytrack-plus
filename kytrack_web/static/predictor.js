@@ -233,7 +233,39 @@ function predictWithExtrapolation(track, settings) {
   return { path, burst, landing, source: "extrapolation" };
 }
 
+async function predictScheduled(launch, settings) {
+  if (!launch || !Number.isFinite(Number(launch.lat)) || !Number.isFinite(Number(launch.lon))) return null;
+  const launchTime = new Date(launch.at).toISOString().replace(/\.\d{3}Z$/, "Z");
+  const ascentRate = Math.max(0.1, Math.abs(Number(settings.ascentRate) || 5));
+  const descentRate = Math.max(0.1, Math.abs(Number(settings.descentRate) || 5));
+  const launchAlt = Number(launch.alt_m) || 0;
+  const burstAltitude = Math.max(Number(settings.burstAltitude) || 35000, launchAlt + 100);
+  const params = new URLSearchParams({
+    launch_latitude: Number(launch.lat).toFixed(4),
+    launch_longitude: Number(launch.lon).toFixed(4),
+    launch_datetime: launchTime,
+    ascent_rate: ascentRate.toFixed(2),
+    burst_altitude: burstAltitude.toFixed(1),
+    descent_rate: descentRate.toFixed(2),
+    launch_altitude: launchAlt.toFixed(1),
+    profile: "standard_profile",
+    format: "json",
+  });
+  try {
+    const response = await fetch(`https://api.v2.sondehub.org/tawhiri?${params.toString()}`, { cache: "no-store" });
+    if (!response.ok) return null;
+    const data = await response.json();
+    return parseTawhiriPrediction(data, true);
+  } catch {
+    return null;
+  }
+}
+
 self.onmessage = async (event) => {
-  const { id, track, settings, cacheKey } = event.data;
+  const { id, mode, track, settings, cacheKey, launch } = event.data;
+  if (mode === "scheduled") {
+    self.postMessage({ id, mode, prediction: await predictScheduled(launch, settings), cacheKey });
+    return;
+  }
   self.postMessage({ id, prediction: await predict(track, settings), cacheKey });
 };
