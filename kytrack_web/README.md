@@ -14,6 +14,8 @@ map.
   to the actual touchdown.
 - Draws a hollow-ring **last-seen** pin where SondeHub telemetry stops
   (blackout or stationary detection), distinct from the predicted landing.
+- Draws a purple landing-history polyline connecting every persisted
+  predicted-landing point, so the convergence of the prediction is visible.
 - Draws a car route from receiver to predicted landing and shows distance
   and duration in the **Drive** field.
 - Pre-flight Payerne forecast in the no-flight state with the same drive

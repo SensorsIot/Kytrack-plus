@@ -29,6 +29,8 @@ open the dashboard at `http://<pi-ip-address>:8080/` from another device.
 - A separate **last-seen** marker (hollow ring) at the last received fix —
   radiosondes typically lose telemetry well above ground, so the predicted
   landing pin marks the actual touchdown, not the last reported position.
+- A purple landing-history polyline showing how the predicted landing point
+  has moved between predictions (de-duplicated at 100 m).
 - Pre-flight Payerne forecast (`11:00 UTC` / `23:00 UTC` slots) with full
   trajectory and driving route when no balloon is in the air.
 - Backend log of every predicted landing per sonde (de-duplicated at 100 m)

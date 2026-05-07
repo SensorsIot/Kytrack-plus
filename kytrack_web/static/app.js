@@ -296,11 +296,15 @@ const LiveMode = {
   landingMarkers: new Map(),
   lastSeenMarkers: new Map(),
   routeLines: new Map(),
+  landingHistoryLines: new Map(),
 
   predictions: new Map(),
   routeMetrics: new Map(),
   predictionCache: new Map(),
   lastSeenPoints: new Map(),
+  landingHistory: new Map(),
+  landingHistoryFetches: new Map(),
+  lastPostedLanding: new Map(),
 
   selectedId: null,
   selectedManual: false,
@@ -311,6 +315,7 @@ const LiveMode = {
 
   async enter(serial) {
     this.serial = serial;
+    this.loadLandingHistory(serial);
     await this.fetchSondeHubTrack(serial, true);
     if (activeMode !== this) return;
     const sondeHub = this.sondeHubTracks.get(serial) || [];
@@ -335,6 +340,9 @@ const LiveMode = {
     this.predictions.clear();
     this.lastSeenPoints.clear();
     this.routeMetrics.clear();
+    this.landingHistory.clear();
+    this.landingHistoryFetches.clear();
+    this.lastPostedLanding.clear();
     this.selectedId = null;
     this.selectedManual = false;
     this.serial = null;
@@ -354,7 +362,10 @@ const LiveMode = {
   onPoint(point, shouldFit) {
     if (point.id !== this.serial) return;
     const isNewTrack = !this.tracks.has(point.id);
-    if (isNewTrack) this.tracks.set(point.id, []);
+    if (isNewTrack) {
+      this.tracks.set(point.id, []);
+      this.loadLandingHistory(point.id);
+    }
     const track = this.tracks.get(point.id);
     track.push(point);
     if (track.length > 300) track.shift();
@@ -380,6 +391,7 @@ const LiveMode = {
     if (cacheKey) this.cachePrediction(cacheKey, prediction);
     this.predictions.set(id, prediction);
     this.drawPrediction(id);
+    this.recordLanding(id, prediction);
     this.render();
   },
 
@@ -641,6 +653,71 @@ const LiveMode = {
     }
   },
 
+  async loadLandingHistory(id) {
+    if (this.landingHistoryFetches.get(id)) return;
+    this.landingHistoryFetches.set(id, true);
+    try {
+      const response = await fetch(`/api/landing-history/${encodeURIComponent(id)}`, { cache: "no-store" });
+      if (!response.ok) return;
+      const data = await response.json();
+      if (activeMode !== this) return;
+      const points = Array.isArray(data?.points) ? data.points : [];
+      this.landingHistory.set(id, points);
+      this.drawLandingHistory(id);
+    } catch {
+      // Best-effort — history polyline is optional.
+    }
+  },
+
+  applyLandingHistory(id, points) {
+    this.landingHistory.set(id, Array.isArray(points) ? points : []);
+    this.drawLandingHistory(id);
+  },
+
+  async recordLanding(id, prediction) {
+    const landing = prediction?.landing;
+    if (!landing || !Number.isFinite(landing.lat) || !Number.isFinite(landing.lon)) return;
+    const last = this.lastPostedLanding.get(id);
+    if (last && distanceMeters(last, landing) < 100) return;
+    this.lastPostedLanding.set(id, { lat: landing.lat, lon: landing.lon });
+    try {
+      const response = await fetch(`/api/landing-history/${encodeURIComponent(id)}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          lat: landing.lat,
+          lon: landing.lon,
+          alt_m: Number.isFinite(landing.alt_m) ? landing.alt_m : null,
+          at: landing.at || new Date().toISOString(),
+        }),
+      });
+      if (!response.ok) return;
+      const data = await response.json();
+      if (activeMode !== this) return;
+      this.applyLandingHistory(id, data?.points);
+    } catch {
+      // Server publishes a landing_history SSE event on success; failures here
+      // just mean the polyline updates on the next prediction tick.
+    }
+  },
+
+  drawLandingHistory(id) {
+    const history = this.landingHistory.get(id) || [];
+    if (history.length < 2) {
+      if (this.landingHistoryLines.has(id)) {
+        map.removeLayer(this.landingHistoryLines.get(id));
+        this.landingHistoryLines.delete(id);
+      }
+      return;
+    }
+    const latlngs = history.map((p) => [p.lat, p.lon]);
+    setPolyline(this.landingHistoryLines, id, latlngs, {
+      color: "#8f3ffc",
+      weight: 4,
+      opacity: 0.9,
+    });
+  },
+
   freshestTrackId() {
     let bestId = null;
     let bestTime = -Infinity;
@@ -693,6 +770,7 @@ const LiveMode = {
       this.landingMarkers,
       this.lastSeenMarkers,
       this.routeLines,
+      this.landingHistoryLines,
     ]) {
       for (const layer of layerMap.values()) map.removeLayer(layer);
       layerMap.clear();
@@ -970,6 +1048,9 @@ function connectEvents() {
     const event = JSON.parse(message.data);
     if (event.type === "snapshot") loadSnapshot(event.tracks);
     if (event.type === "point") dispatchPoint(event.point, true);
+    if (event.type === "landing_history" && activeMode === LiveMode) {
+      LiveMode.applyLandingHistory(event.sonde_id, event.points);
+    }
   };
 }
 

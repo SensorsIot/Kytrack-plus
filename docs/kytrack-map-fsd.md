@@ -281,12 +281,14 @@ The response is parsed as `{ serial: { timestamp: telemetry_point } }`.
   separate local receiver track polyline is drawn.
 - Fetch cadence is at most once per sonde per 60 seconds.
 - The prediction path is drawn as a prominent solid green polyline.
-- Only the **current** predicted landing point is shown (yellow marker).
-  No history of past predicted landing points is rendered or persisted on
-  the frontend; the visual clutter from a long-running flight's drifting
-  prediction was not informative. The backend's
-  `/api/landing-history/{sonde_id}` endpoints remain available for
-  external use but are no longer exercised by this app.
+- The current predicted landing point is shown as a yellow marker.
+- Every prediction tick the frontend POSTs the predicted landing to
+  `POST /api/landing-history/{sonde_id}`; the server de-duplicates against
+  the previous point at 100 m. The full point list (returned by the POST,
+  and broadcast by the backend as a `landing_history` SSE event) is drawn
+  as a purple polyline so the convergence of successive predictions is
+  visible. The polyline is seeded by `GET /api/landing-history/{sonde_id}`
+  the first time the sonde appears.
 
 ## No-Flight State
 
