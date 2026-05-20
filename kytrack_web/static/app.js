@@ -391,6 +391,7 @@ const LiveMode = {
     if (activeMode !== this) return;
     if (id !== this.serial) return;
     if (!prediction) return;
+    if (this.lastSeenPoints.has(id)) return;
     if (cacheKey) this.cachePrediction(cacheKey, prediction);
     this.predictions.set(id, prediction);
     this.drawPrediction(id);
@@ -601,6 +602,7 @@ const LiveMode = {
   },
 
   requestPrediction(id) {
+    if (this.lastSeenPoints.has(id)) return;
     const localTrack = this.tracks.get(id) || [];
     const sondeHubTrack = this.sondeHubTracks.get(id) || [];
     const source = sondeHubTrack.length > localTrack.length ? sondeHubTrack : localTrack;

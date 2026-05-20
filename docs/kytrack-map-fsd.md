@@ -116,10 +116,13 @@ The browser app shall:
     |Δlat| and |Δlon| are < 0.0001° and the mean |Δalt| is < 0.3 m/sample
     → last-seen point = window start.
   When detected, draw a hollow-ring **last-seen marker** at that point and
-  switch the balloon icon to the post-flight style. **Continue** running
-  Tawhiri so the predicted landing (yellow pin) extrapolates from the
-  last-seen point to ground, and the OSRM driving route follows the
-  predicted landing — not the last-seen point.
+  switch the balloon icon to the post-flight style. **Stop** running
+  Tawhiri and stop POSTing to `landing-history` for this sonde — the
+  prediction computed immediately before detection (green descent line,
+  yellow landing pin) and its OSRM driving route remain frozen on the
+  map as the final result. Running new predictions from post-detection
+  telemetry would feed Tawhiri stationary or blackout-tail samples and
+  drift the landing pin away from the actual touchdown.
 - Hide the live telemetry rows (Last, Altitude, Climb, Speed, Burst,
   Landing) when no live track is selected, leaving only the Drive metric
   visible. This keeps the side panel relevant in the no-flight state and
@@ -533,10 +536,13 @@ Acceptance criteria:
   red track, the green live prediction, the predicted landing marker, and
   the car route for that flight.
 - During descent, when the SondeHub flight history goes stationary or
-  blacks out, a hollow-ring last-seen marker appears at the last fix while
-  the green descent line and the yellow landing pin continue to the
-  predicted touchdown. The black driving line ends at the yellow landing
-  pin, not at the last-seen marker.
+  blacks out, a hollow-ring last-seen marker appears at the last fix and
+  prediction work stops for that sonde. The final green descent line,
+  yellow landing pin, and black driving line are the ones computed
+  immediately before detection and remain frozen on the map; new
+  predictions are not issued and no further landing-history points are
+  posted. The black driving line ends at the yellow landing pin, not at
+  the last-seen marker.
 - In the no-flight state the **Balloon** dropdown offers `11:00 UTC` and
   `23:00 UTC`; selecting either re-runs the Tawhiri forecast for today's
   instance of that hour and the new trajectory, landing pin, and driving
