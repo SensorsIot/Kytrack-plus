@@ -36,6 +36,23 @@ META="${BASE}.meta.txt"
 LOG4000="${BASE}.udp4000.log"
 LOG4010="${BASE}.udp4010.log"
 
+# sondeudp doesn't bind its outbound UDP socket until the first sendto().
+# On a freshly-restarted chain the socket may not be in /proc/<pid>/net/udp
+# yet, so we may need to retry. Returns lines of "pid=N fifo=X src_port=Y".
+query_sondeudp_ports() {
+    for pid in $(pgrep sondeudp); do
+        cmd=$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null)
+        fifo=$(echo "$cmd" | grep -oE 'audio_buffer[_0-9]*\.fifo' | head -1)
+        port=""
+        inode=$(readlink "/proc/$pid/fd/3" 2>/dev/null | grep -oE '[0-9]+' | head -1)
+        if [ -n "$inode" ]; then
+            port_hex=$(awk -v inode="$inode" '$10==inode{split($2,a,":"); print a[2]; exit}' "/proc/$pid/net/udp" 2>/dev/null)
+            [ -n "$port_hex" ] && port=$((16#$port_hex))
+        fi
+        echo "pid=$pid fifo=$fifo src_port=$port"
+    done
+}
+
 write_meta() {
     {
         echo "=== Sonde A/B logger ==="
@@ -48,21 +65,8 @@ write_meta() {
         echo "--- frequency_2.txt (SDR2) ---"
         cat /opt/dxlAPRS/setup/frequency_2.txt
         echo
-        echo "--- sondeudp processes (per-SDR identification) ---"
-        for pid in $(pgrep sondeudp); do
-            cmd=$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null)
-            fifo=$(echo "$cmd" | grep -oE 'audio_buffer[_0-9]*\.fifo' | head -1)
-            # sondeudp opens its outbound UDP socket on fd 3 (-S 3).
-            # Read inode from /proc/<pid>/fd/3, then look it up in
-            # /proc/<pid>/net/udp to get the local source port.
-            port=""
-            inode=$(readlink "/proc/$pid/fd/3" 2>/dev/null | grep -oE '[0-9]+' | head -1)
-            if [ -n "$inode" ]; then
-                port_hex=$(awk -v inode="$inode" '$10==inode{split($2,a,":"); print a[2]; exit}' "/proc/$pid/net/udp" 2>/dev/null)
-                [ -n "$port_hex" ] && port=$((16#$port_hex))
-            fi
-            echo "pid=$pid fifo=$fifo src_port=$port"
-        done
+        echo "--- sondeudp processes at start (per-SDR identification) ---"
+        query_sondeudp_ports
         echo
     } > "$META"
 }
@@ -75,9 +79,12 @@ cleanup() {
         echo
         echo "=== Stopped: $(date -u +%Y-%m-%dT%H:%M:%SZ) ==="
         echo
+        echo "--- sondeudp processes at stop (port mapping after frames flowed) ---"
+        query_sondeudp_ports
+        echo
         echo "--- per source-port frame count (UDP 4000, sondeudp -> sondemod) ---"
-        # column 3 in '-tttt' output is the source 'ip.port'
-        awk '/IP /{print $3}' "$LOG4000" 2>/dev/null \
+        # column $4 in '-tttt' output is the source 'ip.port'
+        awk '/IP /{print $4}' "$LOG4000" 2>/dev/null \
             | sort | uniq -c | sort -rn
         echo
         echo "--- decoded sonde frame count (UDP 4010, sondemod -> udpgate4) ---"
