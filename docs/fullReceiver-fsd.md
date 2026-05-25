@@ -230,11 +230,291 @@ Trigger condition for the retune: confirmation from the operator that
 the 402 MHz experiment is complete and no further coverage at 402.000
 is required.
 
+## Pre-Launch PPM Auto-Calibration
+
+### Purpose
+
+Calibrate each RTL-SDR dongle's frequency offset (PPM) automatically
+before each scheduled Payerne launch using an external, regulatory-precise
+reference. Replaces `sdrtst`'s 1 kHz-quantized AFC display (≈10 ppm at
+103.6 MHz — useless for sub-ppm work) and the dead `kalibrate-rtl` path
+(Swiss GSM shut down 2021–2023).
+
+### Background
+
+Empirically verified during 2026-05-25 development:
+
+- **`sdrtst`'s AFC display is quantized to ~1 kHz**, so it cannot close
+  the loop tighter than ~10 ppm at typical reference frequencies.
+- **`kalibrate-rtl` is unusable** in Switzerland (no GSM BCCH).
+- **`rtl_sdr` direct USB access fails** after `rtl_tcp` runs once — the
+  kernel `dvb_usb_rtl28xxu` driver re-binds to the device, blocking
+  subsequent `libusb_claim_interface` calls. Solution: tool talks to the
+  already-running `rtl_tcp` over its TCP control protocol instead.
+- **`rtl_tcp`'s `-P` correction is non-linear**: it modifies both the
+  LO synthesiser divider *and* the ADC sample-rate correction (both
+  driven from the same crystal). Empirical slope ranges 0.4–2.0 ppm of
+  apparent-shift per +1 X depending on dongle and operating freq.
+- **Integer-PPM only**: `rtlsdr_set_freq_correction` takes integer ppm.
+  The actual best-achievable residual is therefore quantized; we can't
+  always reach ≤0.5 ppm even with a perfect reference.
+
+### Goals
+
+- Each dongle's PPM error is driven below **≤0.5 ppm** when achievable,
+  and below **≤1.5 ppm** (the integer-PPM quantization floor) at all
+  times when a usable reference is present.
+- Calibration runs **automatically** on cron, 30 min before each Payerne
+  launch (13:00 / 01:00 CEST).
+- A quiet pre-launch window (no POLYCOM traffic) **does not** trigger an
+  alarm — the prior calibration stays in effect; alert only when the
+  iteration genuinely cannot converge on two consecutive cycles.
+
+### Non-Goals
+
+- Continuous (always-on) PPM tracking.
+- Compensation for sonde-side TX offset (sonde manufacturer property).
+- A 3rd-dongle implementation (schema generalises; code path not built).
+- DAB+ or any other fallback reference (single-source POLYCOM only).
+
+### Reference Signal
+
+**POLYCOM TETRA** — Swiss emergency-services network in 380–400 MHz.
+
+- **Channel used**: `394.6875 MHz` (TETRA 25 kHz grid, closest to the
+  strongest carrier in the 2026-05-25 `rtl_power` scan at HB9BLA QTH:
+  −10.99 dBm, ~19 dB SNR above noise).
+- **Frequency tolerance**: regulated ≤0.05 ppm (GPS / Rb disciplined
+  base stations).
+- **Proximity to sonde band**: ~9 MHz from 403.5 MHz — frequency-
+  dependent tuner effects are negligible at this distance.
+- **Modulation**: π/4-DQPSK in 25 kHz channels. The carrier centre is
+  the spectral mean; an FFT peak with a Hann window finds it cleanly
+  when traffic is present.
+- **Availability**: bursty. Idle windows of several minutes occur,
+  especially around 01 CEST / 23 UTC when operational traffic is low.
+  Handled by the wait/retry loop (see below).
+
+### Measurement Tool — `kycal.py`
+
+Located at `/home/pi/kycal.py`. Speaks the rtl_tcp TCP control
+protocol (no direct USB access). One invocation:
+
+1. Connects to a running `rtl_tcp` on the supplied port (1234 = SDR1,
+   1235 = SDR2). Retries the connect a few times to ride out transient
+   TCP refusals after chain restarts.
+2. Sends `set_sample_rate`, `set_freq_correction`, `set_gain_mode`,
+   `set_agc_mode`, `set_freq` commands.
+3. Swallows ~0.1 s of settling samples after the tune.
+4. **Listen mode** (`--listen-timeout > 0`): streams FFT-sized chunks
+   back to back. After each chunk, runs a Hann-windowed length-2²⁰ FFT
+   (bin = 2.29 Hz at 2.4 MS/s), finds the peak inside a configurable
+   search window around the expected baseband position, refines with
+   three-point parabolic interpolation. Returns immediately when chunk
+   SNR meets `--min-snr`. On TCP reset during streaming, transparently
+   reconnects and resumes — a single hiccup doesn't lose the window.
+5. **Single-shot** (`--listen-timeout 0`): captures one chunk and
+   returns whatever it got.
+6. Emits one JSON line on stdout with `ok`, `residual_ppm` (apparent
+   offset, after the configured correction), `raw_ppm` (residual +
+   applied correction), `snr_db`, `chunks_tried`, `reconnects`,
+   `elapsed_s`, `top_peaks` (top-5 in spectrum for diagnostics), etc.
+
+The tool **does not** modify any system files. All policy lives in the
+wrapper.
+
+### Wrapper — `kycal-cron.sh`
+
+Located at `/home/pi/kycal-cron.sh`. Iterative feedback-control loop
+per dongle:
+
+```
+for each dongle in {SDR1=0, SDR2=1}:
+    current_ppm  = user_info.txt[line 22|23]
+    start_ppm    = current_ppm
+    best_ppm, best_residual = (start_ppm, ∞)
+
+    for attempt in 1..MAX_ITERATIONS:
+        wait_s = POLYCOM_WAIT_SECONDS  if attempt==1  else POLYCOM_RETRY_WAIT_SECONDS
+        kill sdrtst on this port
+        run kycal --listen-timeout=wait_s
+        if !ok:
+            # no usable signal in wait_s — keep prior PPM, exit silently
+            roll back to best_ppm if we'd already stepped
+            return SKIP
+        if |residual| ≤ CONVERGED_PPM:                return OK ("updated"|"skip")
+        if attempt>1 and |residual| ≥ prev_|residual|:
+            roll back to best_ppm
+            if |best_residual| ≤ QUANTIZED_OK_PPM:    return OK ("quantized_ok")
+            else:                                      return FAIL ("no_improvement")
+        step = clip(round(DAMPING × residual), ±MAX_STEP)
+        if step == 0: step = sign(residual)            # guarantee progress
+        new_ppm = current_ppm − step
+        update best_ppm if this iter improved
+        write new_ppm to user_info.txt
+        full chain restart (STOP + START_SDR_1 + START_SDR_2)
+        current_ppm = new_ppm
+
+    # ran out of iterations
+    roll back to best if better
+    return OK("quantized_ok") if |best| ≤ QUANTIZED_OK_PPM else FAIL("max_iter")
+```
+
+After both dongles are processed:
+
+- If any dongle returned **FAIL**: increment `consec_failures` in
+  `/home/pi/.kycal/state.json`. If counter ≥ `ALERT_THRESHOLD_FAILURES`
+  (default 2) and no prior alert is outstanding, send a Telegram alert
+  via the dedicated `@sensorsIOTalarmBot` and set `alert_sent=True`.
+- If any dongle returned **OK** and none returned FAIL: clear failure
+  counter; if a prior alert is outstanding, send a `RECOVERED` Telegram
+  and clear `alert_sent`.
+- If all dongles returned **SKIP** (no usable signal anywhere): state
+  unchanged. The prior calibration remains; no alarm.
+
+#### Configuration knobs (env vars, overridable)
+
+| Knob | Default | Meaning |
+|---|---|---|
+| `POLYCOM_REF` | `394.6875e6` | Reference carrier (Hz) |
+| `FFT_SIZE` | `1048576` (=2²⁰) | FFT length — bin ≈ 2.29 Hz at 2.4 MS/s |
+| `SEARCH_BW` | `30000` | Hz to search around expected baseband peak |
+| `MIN_SNR_DB` | `30` | Squelch — reject any FFT chunk below this SNR |
+| `POLYCOM_WAIT_SECONDS` | `600` | First-measurement listen window |
+| `POLYCOM_RETRY_WAIT_SECONDS` | `90` | Listen window for verify iterations |
+| `POST_RESTART_SLEEP` | `25` | Seconds to wait after chain restart before next measure |
+| `MAX_ITERATIONS` | `5` | Max steps per dongle per cycle |
+| `CONVERGED_PPM` | `0.5` | First-class success threshold |
+| `QUANTIZED_OK_PPM` | `1.5` | Acceptable best-of when iteration can't go lower |
+| `DAMPING` | `0.7` | Step damping factor |
+| `MAX_STEP` | `5` | Cap on per-iteration PPM change |
+| `ALERT_THRESHOLD_FAILURES` | `2` | Consecutive FAIL cycles before alerting |
+
+### Schedule
+
+Cron entries on the Pi (local CEST/CET, user `pi`):
+
+```
+# Pre-launch PPM calibration — 30 min before each Payerne launch
+30 12 * * * /home/pi/kycal-cron.sh
+30  0 * * * /home/pi/kycal-cron.sh
+```
+
+`kycal-cron.sh` writes its log to `/home/pi/kycal-history.log` and the
+CSV to `/home/pi/kycal-history.csv` directly; no shell redirection
+needed in the crontab. When CET resumes in October, both entries shift
+one hour later (`30 11 * * *` and `30 23 * * *`) to remain 30 min before
+the local launch time.
+
+### Notifications
+
+Telegram via `@sensorsIOTalarmBot` (the dedicated alarm bot, distinct
+from the general HA notification bot). Credentials sourced at runtime
+from `/home/pi/.kycal/config` (mode 600):
+
+```
+TELEGRAM_BOT_TOKEN="..."
+TELEGRAM_CHAT_ID="..."
+```
+
+Per [[feedback_alert_policy]]:
+
+- **Alert only** when human intervention is needed. Two consecutive FAIL
+  cycles (no signal at all is *not* a failure; only `no_improvement` or
+  `max_iter` count).
+- **RECOVERED message** sent only if a prior alert was outstanding, to
+  close the loop.
+
+### CSV Schema — `/home/pi/kycal-history.csv`
+
+```
+ts,label,old_ppm,new_ppm,action,residual_ppm,snr_db
+```
+
+`action` values:
+
+| Action | Meaning | Counts toward alarm? |
+|---|---|---|
+| `skip` | first measure already within `CONVERGED_PPM`, no change | no |
+| `updated` | converged after one or more iterations | no |
+| `quantized_ok` | best-of below `QUANTIZED_OK_PPM`, integer step can't reduce | no |
+| `no_improvement` | step made things worse; rolled back; best > `QUANTIZED_OK_PPM` | **yes** |
+| `max_iter` | exhausted `MAX_ITERATIONS`; best > `QUANTIZED_OK_PPM` | **yes** |
+| `measure_fail` | mid-cycle measurement failure (chain restart race) | no |
+| `no_signal_keep_prior` | initial probe found no signal in `POLYCOM_WAIT_SECONDS` | no |
+
+### Restart Strategy
+
+Per-dongle restart of `rtl_tcp` + `sdrtst` proved unreliable (signal
+races, USB busy errors). The wrapper instead uses a **full chain
+restart** (`STOP.sh` + `START_SDR_1.sh` + `START_SDR_2.sh`) for every
+PPM change. Tradeoff: the *other* dongle is also momentarily off-line
+(~25 s). Acceptable because cron runs 30 min before any scheduled
+launch, so no live sonde overlap.
+
+### Files
+
+| Path | Owner | Action |
+|---|---|---|
+| `/home/pi/kycal.py` | git | Python measurement tool |
+| `/home/pi/kycal-cron.sh` | git | Wrapper / iteration controller |
+| `/home/pi/.kycal/config` | runtime (NOT in git) | Telegram credentials, mode 600 |
+| `/home/pi/.kycal/state.json` | runtime | `{alert_sent, consec_failures, ts}` |
+| `/home/pi/kycal-history.csv` | runtime | Append-only audit log |
+| `/home/pi/kycal-history.log` | runtime | Human-readable per-iteration log |
+| `/var/spool/cron/crontabs/pi` | runtime | Two cron entries (see Schedule) |
+| `/opt/dxlAPRS/setup/user_info.txt` | runtime | Lines 22 (SDR1) / 23 (SDR2) rewritten |
+| `/opt/dxlAPRS/setup/user_info.txt.kycal.bak` | runtime | Pre-first-change backup |
+
+### Operational Acceptance
+
+Demonstrated by:
+
+- A scheduled cycle writes a CSV row with `action ∈ {skip, updated,
+  quantized_ok, no_signal_keep_prior}` and the chain still has
+  `rtl_tcp`+`sdrtst` running on both ports afterwards.
+- **Verified 2026-05-25**: SDR1 calibrated against POLYCOM at PPM=2,
+  residual = +0.016 ppm (6 Hz at 394.7 MHz), SNR 51 dB — converged in
+  2 iterations.
+- **Verified 2026-05-25** (iterative-loop test against test sonde):
+  SDR1 took 4 iterations with `0.7×` damping, detected overshoot at
+  iter 4, rolled back to best PPM, exit `quantized_ok` at residual
+  0.97 ppm (the integer-PPM optimum).
+- **Verified 2026-05-25** (TCP-reset resilience): 120 s continuous
+  listen yielded 139 FFT chunks with 1 transparent reconnect.
+- **Verified 2026-05-25** (Telegram path): test message delivered to
+  `@sensorsIOTalarmBot` chat 876235944.
+
+### Risks
+
+- **POLYCOM operator changes its frequency plan.** Mitigation: only the
+  `POLYCOM_REF` env var needs updating. The `rtl_power` sweep helper
+  (`rtl_power -d 1 -f 389M:396M:25k -1 -e 30 -c 20%`) re-identifies the
+  strongest local carrier.
+- **Sustained `no_signal` over many cycles** (e.g. POLYCOM region-wide
+  outage). The prior calibration stays in effect indefinitely; no
+  alarm. Operator monitors `/home/pi/kycal-history.csv` if curious.
+- **Chain-restart-race `measure_fail`** during verify iters. The
+  rollback always restores the prior best PPM, so the worst case is a
+  cycle with no improvement (logged, not alarmed).
+- **DST transition** in October. The cron entries are local-time;
+  shift to `30 11` and `30 23` manually or via a one-time
+  `update-cron-dst.sh`.
+
+### Reversibility
+
+- `/opt/dxlAPRS/setup/user_info.txt.kycal.bak` restores the pre-first-
+  change PPM values with `sudo cp`.
+- Removing the two cron entries reverts to manual operation; the
+  dxlAPRS chain is unchanged.
+- `kycal.py` and `kycal-cron.sh` are self-contained; deletion removes
+  the feature without side effects on the existing decoder.
+
 ## Related
 
 - [[kytrack-config]] — current dxlAPRS topology, port map, channel-file
   format, and Tier-3 watchdog.
 - [[kytrack-map-fsd]] — downstream consumer of decoded sondes via APRS
   TCP on port 14580.
-- [[feedback_alert_policy]] — alert-only-on-give-up rule (unchanged by
-  this FSD).
+- [[feedback_alert_policy]] — alert-only-on-give-up rule (governs cron
+  alerts from the calibration job).
