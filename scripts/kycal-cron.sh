@@ -101,32 +101,65 @@ json.dump({
 PYEOF
 }
 
-# Kill helpers: scan /proc to avoid pgrep self-match risk.
-kill_rtl_tcp_for_device() {
-    local idx="$1"
+# PIDs of processes named $1 whose cmdline contains substring $2.
+# /proc scan avoids pgrep self-match risk.
+pids_matching() {
+    local procname="$1" needle="$2"
     local p cl
-    for p in $(pidof rtl_tcp 2>/dev/null); do
+    for p in $(pidof "$procname" 2>/dev/null); do
         cl=$(tr '\0' ' ' < "/proc/$p/cmdline" 2>/dev/null)
         case " $cl " in
-            *" -d $idx "*) kill "$p" ;;
+            *"$needle"*) printf '%s ' "$p" ;;
         esac
     done
+}
+
+# TERM → wait → KILL escalator. Returns 0 only when no matches remain.
+# A bare `kill` (SIGTERM) used to be fire-and-forget: if sdrtst didn't exit
+# in time we proceeded to spawn a replacement, ending up with two writers
+# on the same FIFO and an eventual orphan.
+kill_matching() {
+    local procname="$1" needle="$2" tag="$3"
+    local pids p i
+    pids=$(pids_matching "$procname" "$needle")
+    [ -z "$pids" ] && return 0
+    log "[$tag] killing $procname '$needle': $pids"
+    for p in $pids; do kill "$p" 2>/dev/null; done
+    for i in 1 2 3 4 5 6; do
+        sleep 0.5
+        pids=$(pids_matching "$procname" "$needle")
+        [ -z "$pids" ] && return 0
+    done
+    log "[$tag] SIGTERM ineffective, escalating to SIGKILL on: $pids"
+    for p in $pids; do kill -9 "$p" 2>/dev/null; done
+    sleep 1
+    pids=$(pids_matching "$procname" "$needle")
+    if [ -n "$pids" ]; then
+        log "[$tag] WARNING: still alive after SIGKILL: $pids"
+        return 1
+    fi
+    return 0
+}
+
+kill_rtl_tcp_for_device() {
+    kill_matching rtl_tcp " -d $1 " "rtl_tcp d=$1"
 }
 
 kill_sdrtst_for_port() {
-    local port="$1"
-    local p cl
-    for p in $(pidof sdrtst 2>/dev/null); do
-        cl=$(tr '\0' ' ' < "/proc/$p/cmdline" 2>/dev/null)
-        case " $cl " in
-            *"127.0.0.1:$port"*) kill "$p" ;;
-        esac
-    done
+    kill_matching sdrtst "127.0.0.1:$1" "sdrtst p=$1"
 }
 
-# Start helpers (detached, nohup, no screen).
+# Start helpers refuse to spawn if a matching process is already running —
+# prevents duplicate writers on the audio FIFO when restart_chain has
+# already brought the process back.
 start_rtl_tcp() {
     local idx="$1" port="$2" ppm="$3"
+    local existing
+    existing=$(pids_matching rtl_tcp " -d $idx ")
+    if [ -n "$existing" ]; then
+        log "[rtl_tcp d=$idx] already running ($existing); not spawning duplicate"
+        return 0
+    fi
     nohup rtl_tcp -d "$idx" -a 127.0.0.1 -p "$port" -g 0 -b 20 -P "$ppm" \
         > "/tmp/rtl_tcp_d${idx}.log" 2>&1 < /dev/null &
     disown
@@ -134,6 +167,12 @@ start_rtl_tcp() {
 
 start_sdrtst() {
     local idx="$1" port="$2" cfg="$3" fifo="$4"
+    local existing
+    existing=$(pids_matching sdrtst "127.0.0.1:$port")
+    if [ -n "$existing" ]; then
+        log "[sdrtst p=$port] already running ($existing); not spawning duplicate"
+        return 0
+    fi
     nohup /opt/dxlAPRS/bin/sdrtst \
         -c "/opt/dxlAPRS/config/$cfg" \
         -t "127.0.0.1:$port" \
@@ -141,6 +180,43 @@ start_sdrtst() {
         -s "/opt/dxlAPRS/tmp/$fifo" \
         > "/tmp/sdrtst_${idx}.log" 2>&1 < /dev/null &
     disown
+}
+
+# Verify exactly one rtl_tcp per device and one sdrtst per port.
+# Prune duplicates (keep the oldest by start time). Logs missing instances.
+audit_chain() {
+    local tag="${1:-audit}"
+    local idx port pids count keep p
+    for idx in 0 1; do
+        case "$idx" in
+            0) port=1234 ;;
+            1) port=1235 ;;
+        esac
+        pids=$(pids_matching rtl_tcp " -d $idx ")
+        count=$(echo $pids | wc -w)
+        if [ "$count" -gt 1 ]; then
+            keep=$(ps -o pid=,etimes= -p $pids 2>/dev/null | sort -k2 -n -r | head -1 | awk '{print $1}')
+            log "[$tag] duplicate rtl_tcp d=$idx: $pids — keeping oldest=$keep"
+            for p in $pids; do
+                [ "$p" = "$keep" ] && continue
+                kill "$p" 2>/dev/null
+            done
+        elif [ "$count" -eq 0 ]; then
+            log "[$tag] no rtl_tcp for d=$idx"
+        fi
+        pids=$(pids_matching sdrtst "127.0.0.1:$port")
+        count=$(echo $pids | wc -w)
+        if [ "$count" -gt 1 ]; then
+            keep=$(ps -o pid=,etimes= -p $pids 2>/dev/null | sort -k2 -n -r | head -1 | awk '{print $1}')
+            log "[$tag] duplicate sdrtst port=$port: $pids — keeping oldest=$keep"
+            for p in $pids; do
+                [ "$p" = "$keep" ] && continue
+                kill "$p" 2>/dev/null
+            done
+        elif [ "$count" -eq 0 ]; then
+            log "[$tag] no sdrtst for port=$port"
+        fi
+    done
 }
 
 # Run kycal, return the JSON line. Caller is responsible for having
@@ -194,6 +270,7 @@ restart_chain() {
     nohup /opt/dxlAPRS/scripts/START_SDR_2.sh > /tmp/kycal_sdr2_restart.log 2>&1 < /dev/null &
     disown
     sleep "$POST_RESTART_SLEEP"
+    audit_chain "post-restart"
 }
 
 # Process one dongle by iterating measure → step → restart until one of:
@@ -376,6 +453,8 @@ log "=== kycal-cron start ==="
 if [ ! -f "$HISTORY" ]; then
     echo "ts,label,old_ppm,new_ppm,action,residual_ppm,snr_db" > "$HISTORY"
 fi
+
+audit_chain "entry"
 
 ANY_FAIL=0
 ANY_OK=0
