@@ -8,6 +8,14 @@
 # healthy, exactly 0 when wedged. We sample it twice with a sleep in between;
 # if the delta is below the threshold we kill rtl_tcp and re-issue its
 # original argv into the dxlAPRS screen window so it relaunches in place.
+#
+# bytes_sent is per-connection: it resets to ~0 whenever the rtl_tcp socket
+# is re-established (e.g. kycal-cron takes the dongle for PPM calibration,
+# or rtl_tcp itself is restarted). That makes the delta go NEGATIVE, which
+# is a counter reset, not a wedge (a real wedge is delta ~= 0). We must not
+# restart on a negative delta — doing so let kycal's twice-daily teardown
+# trigger a self-amplifying restart storm. A negative delta just means
+# "re-baseline next cycle".
 set -u
 
 INTERVAL="${INTERVAL:-30}"
@@ -78,6 +86,13 @@ while true; do
       continue
     fi
     delta=$(( b - a ))
+    if [ "$delta" -lt 0 ]; then
+      # Counter reset: the rtl_tcp connection was re-established (kycal took
+      # the dongle, or rtl_tcp restarted). Not a wedge — skip; the top of the
+      # loop re-baselines before[$port] for the next cycle.
+      log "SDR $device port $port counter reset (Δ=${delta} B); no action"
+      continue
+    fi
     if [ "$delta" -lt "$MIN_BYTES" ]; then
       log "SDR $device port $port wedged (Δ=${delta} B over ${INTERVAL}s)"
       if restart_dongle "$device" "$session" "$window"; then
