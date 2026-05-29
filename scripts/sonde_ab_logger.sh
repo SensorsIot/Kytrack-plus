@@ -9,19 +9,66 @@
 #     ready for APRS-IS upload. Used as the "is the balloon still alive?"
 #     signal.
 # Stops 15 min after the last decoded sonde frame on UDP 4010, or after a
-# 2 h wait if no decode ever arrives.
+# 2 h wait if no decode ever arrives, and unconditionally at a 4 h hard cap
+# (MAX_RUNTIME_SEC) so a malformed log can never wedge the loop.
+#
+# Robustness invariants (each earned from a real wedge — see git history):
+#   - Single-instance lock is self-clearing: the lockfile carries the
+#     holder's pid + expiry, so a dead-or-overran holder is reclaimed rather
+#     than blocking every future run forever.
+#   - Teardown is bounded (TERM -> grace -> KILL); never a bare `wait` that
+#     can hang on a child the kill missed.
+#   - The loop keys off the last *parseable* UDP-4010 line, so NUL/partial
+#     writes can't defeat both the empty-file and silence exits.
 
 set -u
 
 LOGDIR=/home/pi/sonde_ab_logs
 mkdir -p "$LOGDIR"
 
+# Hard cap on a single run. A logger that outlives this is wedged; the next
+# invocation reclaims its lock. Must exceed the loop's own wall-clock cap.
+MAX_RUNTIME_SEC=${MAX_RUNTIME_SEC:-$((4 * 3600))}
+LOCK_TTL_SEC=${LOCK_TTL_SEC:-$((MAX_RUNTIME_SEC + 600))}
+
+# Self-clearing lock. The lockfile holds "<pid> <expiry_epoch>". A prior
+# holder is honoured only while its pid is alive AND it hasn't overrun
+# LOCK_TTL_SEC. A dead-or-overran holder is reclaimed (killed + lock stolen)
+# so one wedged instance can't block captures forever. Open append (not '>')
+# so probing our own fd doesn't truncate a live holder's stamp.
 LOCKFILE=/tmp/sonde_ab_logger.lock
-exec 9>"$LOCKFILE"
+exec 9>>"$LOCKFILE"
 if ! flock -n 9; then
-    echo "Another logger is running; exiting."
-    exit 0
+    holder_pid=$(awk 'NR==1{print $1}' "$LOCKFILE" 2>/dev/null)
+    holder_exp=$(awk 'NR==1{print $2}' "$LOCKFILE" 2>/dev/null)
+    now=$(date -u +%s)
+    stale=0
+    if [ -z "$holder_pid" ] || ! kill -0 "$holder_pid" 2>/dev/null; then
+        stale=1   # holder gone but lock file lingered
+    elif [ -n "$holder_exp" ] && [ "$now" -gt "$holder_exp" ]; then
+        stale=1   # holder alive but overran its TTL → wedged
+    fi
+    if [ "$stale" -ne 1 ]; then
+        echo "Another logger is running (pid=${holder_pid:-?}); exiting."
+        exit 0
+    fi
+    echo "Reclaiming stale lock (pid=${holder_pid:-?}, exp=${holder_exp:-?})."
+    if [ -n "$holder_pid" ]; then
+        pkill -TERM -P "$holder_pid" 2>/dev/null || true
+        kill -TERM "$holder_pid" 2>/dev/null || true
+        sleep 3
+        pkill -KILL -P "$holder_pid" 2>/dev/null || true
+        kill -KILL "$holder_pid" 2>/dev/null || true
+        sleep 1
+    fi
+    if ! flock -n 9; then
+        echo "Could not reclaim lock after killing pid ${holder_pid:-?}; exiting."
+        exit 0
+    fi
 fi
+# We hold the lock. Stamp it with our pid and expiry (truncating write; the
+# flock lives on fd 9's open-file description, unaffected by this rewrite).
+printf '%s %s\n' "$$" "$(( $(date -u +%s) + LOCK_TTL_SEC ))" > "$LOCKFILE"
 
 TS=$(date -u +%Y%m%d-%H%M)
 HR=$(date -u +%H)
@@ -77,7 +124,19 @@ write_meta() {
 }
 
 cleanup() {
-    kill "$PID_4000" "$PID_4010" "${PID_SNAP:-}" 2>/dev/null || true
+    # Bounded teardown. A bare `wait` here used to deadlock forever if any
+    # child survived the initial TERM, which kept the flock held and blocked
+    # every later run. Escalate to KILL after a grace period instead.
+    local kids="$PID_4000 $PID_4010 ${PID_SNAP:-}"
+    for pid in $kids; do kill -TERM "$pid" 2>/dev/null || true; done
+    for _ in 1 2 3 4 5; do
+        local alive=0
+        for pid in $kids; do kill -0 "$pid" 2>/dev/null && alive=1; done
+        [ "$alive" -eq 0 ] && break
+        sleep 1
+    done
+    for pid in $kids; do kill -KILL "$pid" 2>/dev/null || true; done
+    # SIGKILL is uncatchable, so this wait now returns promptly.
     wait 2>/dev/null || true
     sync
     {
@@ -164,11 +223,27 @@ POLL_SEC=${POLL_SEC:-10}
 
 start_unix=$(date -u +%s)
 
+# Regex for a real tcpdump '-tttt' line: 'YYYY-MM-DD HH:MM:SS.uuuuuu IP ...'.
+# Matching on this (rather than `[ -s ]` / `tail -1`) makes the loop robust to
+# garbage in the file — e.g. a NUL-filled region from a stray writer once made
+# the file non-empty while its tail was unparseable, which defeated both the
+# empty-file and silence exits and wedged the loop indefinitely.
+TS_RE='^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}'
+
 while true; do
     read -r -t "$POLL_SEC" _ < /dev/null 2>/dev/null || true
 
-    if [ ! -s "$LOG4010" ]; then
-        elapsed=$(($(date -u +%s) - start_unix))
+    elapsed=$(($(date -u +%s) - start_unix))
+    # Unconditional wall-clock backstop: nothing below can keep us past this.
+    if [ "$elapsed" -gt "$MAX_RUNTIME_SEC" ]; then
+        echo "Max runtime ${MAX_RUNTIME_SEC}s reached. Stopping." >> "$META"
+        break
+    fi
+
+    # Last *parseable* decoded line (skips NULs / partial writes).
+    last_line=$(grep -aE "$TS_RE" "$LOG4010" 2>/dev/null | tail -1)
+    if [ -z "$last_line" ]; then
+        # No decode yet — give up only after the first-decode wait window.
         if [ "$elapsed" -gt "$MAX_WAIT_FOR_FIRST_SEC" ]; then
             echo "No UDP 4010 decode in ${MAX_WAIT_FOR_FIRST_SEC}s. Giving up." >> "$META"
             break
@@ -176,9 +251,6 @@ while true; do
         continue
     fi
 
-    # Parse timestamp of last decoded packet
-    # Format: 'YYYY-MM-DD HH:MM:SS.uuuuuu IP 127.0.0.1.X > 127.0.0.1.4010: ...'
-    last_line=$(tail -1 "$LOG4010")
     last_ts_str=$(echo "$last_line" | awk '{print $1, $2}' | cut -d. -f1)
     last_unix=$(date -u -d "$last_ts_str UTC" +%s 2>/dev/null || true)
     if [ -z "$last_unix" ]; then
