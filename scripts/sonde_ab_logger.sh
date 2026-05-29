@@ -12,10 +12,10 @@
 # 2 h wait if no decode ever arrives, and unconditionally at a 4 h hard cap
 # (MAX_RUNTIME_SEC) so a malformed log can never wedge the loop.
 #
-# Robustness invariants (each earned from a real wedge — see git history):
+# Invariants:
 #   - Single-instance lock is self-clearing: the lockfile carries the
 #     holder's pid + expiry, so a dead-or-overran holder is reclaimed rather
-#     than blocking every future run forever.
+#     than blocking every future run.
 #   - Teardown is bounded (TERM -> grace -> KILL); never a bare `wait` that
 #     can hang on a child the kill missed.
 #   - The loop keys off the last *parseable* UDP-4010 line, so NUL/partial
@@ -124,9 +124,9 @@ write_meta() {
 }
 
 cleanup() {
-    # Bounded teardown. A bare `wait` here used to deadlock forever if any
-    # child survived the initial TERM, which kept the flock held and blocked
-    # every later run. Escalate to KILL after a grace period instead.
+    # Bounded teardown: a bare `wait` can hang forever on a child that
+    # survived the initial TERM (and the flock stays held while it hangs).
+    # Escalate to KILL after a grace period instead.
     local kids="$PID_4000 $PID_4010 ${PID_SNAP:-}"
     for pid in $kids; do kill -TERM "$pid" 2>/dev/null || true; done
     for _ in 1 2 3 4 5; do
@@ -224,10 +224,10 @@ POLL_SEC=${POLL_SEC:-10}
 start_unix=$(date -u +%s)
 
 # Regex for a real tcpdump '-tttt' line: 'YYYY-MM-DD HH:MM:SS.uuuuuu IP ...'.
-# Matching on this (rather than `[ -s ]` / `tail -1`) makes the loop robust to
-# garbage in the file — e.g. a NUL-filled region from a stray writer once made
-# the file non-empty while its tail was unparseable, which defeated both the
-# empty-file and silence exits and wedged the loop indefinitely.
+# Matching on this (rather than `[ -s ]` / `tail -1`) keeps the loop robust to
+# garbage in the file: a NUL-filled region would make the file non-empty while
+# its tail is unparseable, which would otherwise defeat both the empty-file and
+# silence exits.
 TS_RE='^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}'
 
 while true; do

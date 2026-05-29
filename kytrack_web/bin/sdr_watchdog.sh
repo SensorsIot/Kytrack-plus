@@ -12,10 +12,8 @@
 # bytes_sent is per-connection: it resets to ~0 whenever the rtl_tcp socket
 # is re-established (e.g. kycal-cron takes the dongle for PPM calibration,
 # or rtl_tcp itself is restarted). That makes the delta go NEGATIVE, which
-# is a counter reset, not a wedge (a real wedge is delta ~= 0). We must not
-# restart on a negative delta — doing so let kycal's twice-daily teardown
-# trigger a self-amplifying restart storm. A negative delta just means
-# "re-baseline next cycle".
+# is a counter reset, not a wedge (a real wedge is delta ~= 0). A negative
+# delta must not trigger a restart — it just means "re-baseline next cycle".
 set -u
 
 INTERVAL="${INTERVAL:-30}"

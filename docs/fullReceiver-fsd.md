@@ -463,25 +463,16 @@ wedged (TCP up, zero IQ flow).
 `bytes_sent` is **per-connection**. Every time kycal-cron kills `sdrtst`
 to take the dongle, connects its own socket, then runs `restart_chain`
 (which bounces `rtl_tcp` itself), the listener's counter resets to ~0 and
-the watchdog's next delta goes massively **negative**.
+the watchdog's next delta goes **negative**.
 
-**Bug (fixed 2026-05-29):** the watchdog compared `delta < MIN_BYTES`,
-which a negative delta also satisfies, so it read each counter reset as a
-wedge and restarted — which reset the counter again — looping for the
-whole ~10–15 min kycal window. Because kycal runs at 10:30 and 22:30 UTC,
-this produced a **self-amplifying restart storm twice daily**, the 22:30
-one landing in the Payerne 23Z pre-launch window. Observed deltas were
-all large negatives (e.g. `Δ=-175692954462`), never near zero.
-
-**Fix:** the watchdog now treats `delta < 0` as a counter reset — logs
-`counter reset (Δ=…); no action` and re-baselines on the next cycle
-rather than restarting. A genuine wedge still presents as `delta ≈ 0`
-(rtl_tcp up, no flow) and is caught unchanged, at worst one 30 s cycle
-later. No coordination token was added: every observed false trip was a
-negative delta, so the guard alone closes the storm without kycal needing
-to know the watchdog exists. The normal receiver chain continues to
-"feed" the watchdog implicitly via byte flow; kycal's existing orderly
-stop → calibrate → `restart_chain` is unchanged.
+The watchdog treats `delta < 0` as a counter reset, not a wedge: it logs
+`counter reset (Δ=…); no action` and re-baselines on the next cycle. A
+genuine wedge presents as `delta ≈ 0` (rtl_tcp up, no flow) and triggers a
+restart, at worst one 30 s cycle after a reset. There is no coordination
+token: the negative-delta guard alone keeps kycal's twice-daily teardown
+from being read as a wedge. The normal receiver chain "feeds" the watchdog
+implicitly via byte flow; kycal owns the dongle through its orderly
+stop → calibrate → `restart_chain` cycle.
 
 ### Files
 
