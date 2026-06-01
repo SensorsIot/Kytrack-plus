@@ -38,6 +38,12 @@ CONVERGED_PPM=${CONVERGED_PPM:-0.5}          # |residual| at-or-below this = ok
 QUANTIZED_OK_PPM=${QUANTIZED_OK_PPM:-1.5}    # acceptable if no-improvement landed here
 DAMPING=${DAMPING:-0.7}                       # apply 0.7×residual per step
 MAX_STEP=${MAX_STEP:-5}                       # cap per-iteration X change
+# Hard sanity bound on the applied correction. A real RTL-SDR is within a few ppm
+# (these dongles measure ≤3). A reading implying a far larger error is a spurious
+# tuner lock (landing on an image/spur), not the reference — it must never be
+# stepped toward or written into rtl_tcp -P. Keep generous headroom over the real
+# ±3 so a legit dongle is never rejected; override via env if hardware changes.
+PPM_ABS_MAX=${PPM_ABS_MAX:-10}
 ALERT_THRESHOLD_FAILURES=${ALERT_THRESHOLD_FAILURES:-2}
 
 # POLYCOM may be idle for minutes at quiet times (esp. ~23 UTC = 01 CEST).
@@ -344,6 +350,26 @@ process_dongle() {
         abs_res=$(python3 -c "print(abs($M_RES))")
         log "[$label] iter $attempt: residual=$cur_res (|=$abs_res) SNR=${cur_snr}dB"
 
+        # Plausibility gate: raw_ppm is the dongle's true error. Beyond PPM_ABS_MAX
+        # it is a spurious lock, not a calibration signal — reject like a
+        # measure_fail so we never step toward it or apply it.
+        local abs_raw
+        abs_raw=$(python3 -c "print(abs($M_RAW))")
+        if python3 -c "import sys; sys.exit(0 if $abs_raw > $PPM_ABS_MAX else 1)"; then
+            log "[$label] iter $attempt: IMPLAUSIBLE raw_ppm=$M_RAW (|=$abs_raw| > $PPM_ABS_MAX) — spurious lock, rejecting"
+            if [ "$current_ppm" != "$best_ppm" ] && [ -n "$best_abs" ]; then
+                log "[$label] rolling back PPM $current_ppm -> $best_ppm (best |residual|=$best_abs)"
+                sudo sed -i "${line}s/^.*\$/${best_ppm}/" "$USER_INFO"
+                restart_chain
+                current_ppm="$best_ppm"
+            fi
+            start_sdrtst "$idx" "$port" "$cfg" "$fifo"
+            printf '%s,%s,%s,%s,%s,%s,%s\n' \
+                "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$label" "$start_ppm" "$current_ppm" "implausible_reject" "$M_RES" "$M_SNR" >> "$HISTORY"
+            echo SKIP
+            return 0
+        fi
+
         # Update best if this is the smallest |residual| seen so far.
         if [ -z "$best_abs" ] || python3 -c "import sys; sys.exit(0 if $abs_res < $best_abs else 1)"; then
             best_ppm="$current_ppm"
@@ -406,6 +432,15 @@ if s==0:
 print(s)
 ")
         local new_ppm=$((current_ppm - step))
+        # Defense in depth: clamp the applied correction to the sane window so a
+        # bad step can never write a wild -P into rtl_tcp.
+        if [ "$new_ppm" -gt "$PPM_ABS_MAX" ]; then
+            log "[$label] clamping new PPM $new_ppm -> $PPM_ABS_MAX (PPM_ABS_MAX)"
+            new_ppm="$PPM_ABS_MAX"
+        elif [ "$new_ppm" -lt "-$PPM_ABS_MAX" ]; then
+            log "[$label] clamping new PPM $new_ppm -> -$PPM_ABS_MAX (PPM_ABS_MAX)"
+            new_ppm="-$PPM_ABS_MAX"
+        fi
         log "[$label] iter $attempt: step=$step → new PPM $current_ppm -> $new_ppm"
 
         if [ ! -f "$USER_INFO_BAK" ]; then
