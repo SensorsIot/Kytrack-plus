@@ -159,23 +159,31 @@ cleanup() {
         tail -1 "$LOG4010" 2>/dev/null || true
         echo
         echo "--- per-SDR sondeudp decode telemetry (from screen snapshots) ---"
-        # Dedupe by frame number (column 3 of 'N:R41 SERIAL FRAMENUM ...').
-        # IF=6500 on SDR1's 403.500, IF=12000 on SDR2's 403.500 (A/B test).
+        # A/B test: SDR1's 403.500 runs IF=6500, SDR2's 403.500 runs IF=12000.
+        # sondeudp prints one line per received frame: 'CHAN:R41 SERIAL FRAME ...'.
+        #   good frame -> '... 20YY.MM.DD HH:MM:SS <lat> <lon> <alt>m ...'
+        #   bad  frame -> '... ----  crc err  -NN.NdB MM% <flags>'
+        # The signal level (dB) and demod-match (%) are only emitted on marginal
+        # (crc-err) frames; good frames carry position instead. Snapshots repeat
+        # each frame verbatim, so sort -u over full lines yields unique frames.
         for sdr in 1 2; do
             log_file="${BASE}.sdr${sdr}_sondeudp.log"
-            if [ -s "$log_file" ]; then
-                # Extract unique R41 frames by (serial, framenum) tuple.
-                unique=$(grep -E '^[0-9]+:R41' "$log_file" 2>/dev/null \
-                    | awk '{print $2, $3}' | sort -u | wc -l)
-                # Quality average over all (deduped) frames.
-                avg_q=$(grep -E '^[0-9]+:R41.*dBm' "$log_file" 2>/dev/null \
-                    | awk '{print $2, $3, $0}' | sort -u -k1,2 \
-                    | grep -oE '[0-9]+%' | tr -d '%' \
-                    | awk '{s+=$1;n++} END {if(n>0) printf "%.1f", s/n; else print "n/a"}')
-                # FEC corrections (count of '+NR' tokens).
-                fec=$(grep -oE '\+[0-9]+R' "$log_file" 2>/dev/null | wc -l)
-                echo "SDR${sdr}: ${unique} unique frames, avg quality ${avg_q}%, ${fec} FEC events"
-            fi
+            [ -s "$log_file" ] || continue
+            frames=$(grep -aE '^[0-9]+:R41 ' "$log_file" 2>/dev/null | sort -u)
+            # Good = carries a decoded date+position; dedupe by (chan,serial,frame).
+            good=$(printf '%s\n' "$frames" \
+                | grep -E ' 20[0-9]{2}\.[0-9]{2}\.[0-9]{2} ' \
+                | awk -F'[ :]' '{print $1,$3,$4}' | sort -u | grep -c .)
+            bad=$(printf '%s\n' "$frames" | grep -c 'crc err')
+            total=$((good + bad))
+            rate=$(awk -v b="$bad" -v t="$total" \
+                'BEGIN{if(t>0) printf "%.1f", 100*b/t; else printf "n/a"}')
+            # Level/quality, averaged over the marginal frames that report them.
+            avg_db=$(printf '%s\n' "$frames" | grep -oE '\-[0-9]+\.[0-9]+dB' \
+                | tr -d 'dB' | awk '{s+=$1;n++} END{if(n>0) printf "%.1f", s/n; else printf "n/a"}')
+            avg_q=$(printf '%s\n' "$frames" | grep -oE '[0-9]+%' | tr -d '%' \
+                | awk '{s+=$1;n++} END{if(n>0) printf "%.0f", s/n; else printf "n/a"}')
+            echo "SDR${sdr}: ${good} good frames, ${bad} crc-err (${rate}% err), marginal-frame avg ${avg_db}dB / ${avg_q}% match"
         done
     } >> "$META"
 }
