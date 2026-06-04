@@ -50,7 +50,8 @@ and the 404.0 anchor.
 - Splitting `sondemod` into per-SDR instances.
 - Decoding non-radiosonde signals.
 - Storing per-decode telemetry beyond what dxlAPRS already does in screen
-  scrollback.
+  scrollback (the later IF-Width A/B Optimiser does persist per-capture
+  frame counts for its own purposes — see that section).
 
 ## Architecture
 
@@ -87,6 +88,11 @@ Filter rolloff is ~3 dB at each dongle's outer edges. This affects:
 The exact channel lists are written into the two existing channel-list
 files. Channel spacing is 100–300 kHz (matching observed sonde-frequency
 quantisation).
+
+The trailing field on each line is the IF filter width in Hz. On 403.500 it
+is **not fixed**: both dongles' 403.500 width is managed by the IF-Width A/B
+Optimiser (see that section) — SDR2 holds the current best width, SDR1 carries
+the challenger. All other channels stay at 6500.
 
 **`/opt/dxlAPRS/setup/frequency_1.txt`** (SDR1)
 
@@ -531,6 +537,123 @@ Demonstrated by:
   dxlAPRS chain is unchanged.
 - `kycal.py` and `kycal-cron.sh` are self-contained; deletion removes
   the feature without side effects on the existing decoder.
+
+## IF-Width A/B Optimiser
+
+### Purpose
+
+Find the IF filter width that decodes the most Payerne 403.500 MHz frames, and
+keep the receiver tuned to it automatically. The two dongles both cover 403.500
+(see Band plan), so they form a paired A/B: on every flight they decode the same
+sonde simultaneously, one at the current best width, one at a challenger width.
+A nightly-and-middday controller hill-climbs toward the optimum without operator
+involvement.
+
+Empirically, 6500 Hz decodes 2.3–15× more good frames than 12000 Hz across five
+paired passes (the advantage follows the width across a dongle swap, so it is the
+filter, not the receiver). The optimum may lie below 6500; the optimiser searches
+for it.
+
+### Data flow
+
+```
+sonde_ab_logger.sh (per capture) → per-SDR sondeudp screen logs + meta.txt
+        │
+        ├─ ab_accumulate.py  → ab_results.csv   (one row per capture, audit)
+        └─ ab_controller.py  → state.json + edits the 403.500 width in the
+                                 channel files for the next sdrtst restart
+```
+
+A good frame in a sondeudp log is `CHAN:TYPE SERIAL FRAMENUM YYYY.MM.DD HH:MM:SS
+…`; a CRC error carries `---- crc err` instead. The sonde's own `FRAMENUM` is the
+pairing key. Taking the decoded frame numbers as a **set** per dongle collapses
+the repeated screen-snapshots to one entry per real frame.
+
+### Decision — McNemar on paired frames
+
+For one capture, on each dongle's 403.500 channel, collect the set of good frame
+numbers. With `b` = champion-only frames and `c` = challenger-only frames, McNemar
+tests `b` vs `c` against an even split. A width change is applied only when
+`p < ALPHA` (0.05) and `b + c ≥ MIN_DISCORDANT` (10). Validity is anchored on the
+control/champion side: it must have ≥ `MIN_FRAMES` (30) good frames and a matching
+sonde serial — so a near-dead challenger is a clear loss, not an invalid pass, and
+an off-frequency or signal-less flight simply holds.
+
+### Hill-climb
+
+- Champion = best width found so far; challenger = champion ± step.
+- Significant **win** → challenger becomes champion, keep stepping the same
+  direction. Significant **loss** → reverse direction and halve the step.
+- Start 6500 Hz, step 1000, direction narrower. Step floor `STEP_MIN` 500 Hz.
+- Converged when a reversal would drop below `STEP_MIN`, or after
+  `CONVERGE_HOLDS` (3) consecutive non-significant flights at the floor. At
+  convergence both dongles adopt the optimum.
+- Width is bounded to `BOUNDS` (3000–12000 Hz). The decode-rate-vs-width curve is
+  unimodal (peak near the signal's occupied bandwidth), so a 1-D line search is
+  sufficient — no local-minima handling needed.
+
+### Safety invariants
+
+- **SDR2 (control) always runs the champion width.** Live 403.500 tracking never
+  drops below the best width found so far; only SDR1 — redundant on 403.500 — ever
+  carries an unproven challenger.
+- A flight is acted on only when its live widths match what the state expects
+  (`run_live` guard); a missed run, external edit, or a capture straddling a
+  restart is logged and skipped rather than corrupting the climb.
+- Per-dongle bias was measured negligible, so the challenger stays fixed on SDR1
+  (no dongle-swap step).
+
+### Two steps per day
+
+`kycal-cron` restarts `sdrtst` (re-reading the width from the channel files) at
+both 00:30 and 12:30 CEST, so each daily flight tests a fresh width:
+
+| Decision after | Controller run | Applied at | Tested by |
+|---|---|---|---|
+| overnight flight | 05:45 CEST | 12:30 restart | that day's midday flight |
+| midday flight | 15:45 CEST | 00:30 restart | that night's overnight flight |
+
+### Files
+
+| Path | Owner | Action |
+|---|---|---|
+| `/home/pi/ab_accumulate.py` | git (`scripts/`) | Rebuilds `ab_results.csv` from all `*.meta.txt`; idempotent |
+| `/home/pi/ab_controller.py` | git (`scripts/`) | Closed-loop optimiser; `--status`, `--dry-run-history`, `--init` |
+| `/home/pi/sonde_ab_logs/ab_results.csv` | runtime | One row per capture: per-SDR 403.500 width, locked freq, frame counts, `both_on_403500`, `narrow_over_wide` |
+| `/home/pi/sonde_ab_logs/ab_controller_state.json` | runtime | Champion/challenger width, step, direction, phase, climb history |
+| `/home/pi/sonde_ab_logs/ab_controller.log` | runtime | Per-run decision audit |
+| `/opt/dxlAPRS/{setup/frequency_{1,2}.txt,config/sdr_config{,_2}.txt}` | runtime | 403.500 width field rewritten in place |
+| `*.bak-abctl` next to each of those 4 files | runtime | Pre-first-change revert point |
+
+The width-rewrite preserves each line's terminator; otherwise the 403.500 entry
+fuses with the next channel (only visible on SDR2, whose 403.500 is not the last
+line).
+
+### Schedule
+
+```
+30  5,15 * * *  python3 /home/pi/ab_accumulate.py   # rebuild ab_results.csv
+45  5,15 * * *  python3 /home/pi/ab_controller.py    # evaluate newest capture, step width
+```
+
+### Log retention
+
+Raw `*_sondeudp.log` (~20 MB each — 99 % of the directory) and `*.udp40*.log` are
+pruned at 14 days by cron; the tiny `*.meta.txt`, `ab_results.csv`, state, and
+decision log are kept. The controller needs the raw logs only on the capture
+night, so 14 days is ample; steady-state footprint ≈ 0.5 GB.
+
+```
+10  6 * * *  find /home/pi/sonde_ab_logs -maxdepth 1 -name '*_sondeudp.log' -mtime +14 -delete; \
+             find /home/pi/sonde_ab_logs -maxdepth 1 -name '*.udp40*.log' -mtime +14 -delete
+```
+
+### Reversibility
+
+- Restore the 4 channel files from `*.bak-abctl` and remove the controller +
+  accumulator cron lines to return the 403.500 width to its pre-optimiser value.
+- `ab_accumulate.py` / `ab_controller.py` are self-contained; deleting them and
+  the cron entries removes the feature with no effect on the decode chain.
 
 ## Related
 
