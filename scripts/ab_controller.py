@@ -232,7 +232,11 @@ def log(msg):
     line = msg if msg.startswith("[") else "  " + msg
     with open(DECISIONS, "a") as fh:
         fh.write(line + "\n")
-    print(line)
+    # Echo to the terminal only when interactive. Under cron, stdout is
+    # redirected into DECISIONS itself, so printing there would write every
+    # line a second time. Tracebacks still reach the log via stderr.
+    if sys.stdout.isatty():
+        print(line)
 
 
 def load_state():

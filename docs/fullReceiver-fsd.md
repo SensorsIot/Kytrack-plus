@@ -89,10 +89,10 @@ The exact channel lists are written into the two existing channel-list
 files. Channel spacing is 100–300 kHz (matching observed sonde-frequency
 quantisation).
 
-The trailing field on each line is the IF filter width in Hz. On 403.500 it
-is **not fixed**: both dongles' 403.500 width is managed by the IF-Width A/B
-Optimiser (see that section) — SDR2 holds the current best width, SDR1 carries
-the challenger. All other channels stay at 6500.
+The trailing field on each line is the IF filter width in Hz. The 403.500 width
+is managed by the IF-Width A/B Optimiser (see that section), which **converged at
+7000 Hz** on 2026-06-06; both dongles' 403.500 channel now runs 7000. All other
+channels stay at 6500.
 
 **`/opt/dxlAPRS/setup/frequency_1.txt`** (SDR1)
 
@@ -103,13 +103,13 @@ f 402.500 10 60 70 6500
 f 402.700 10 60 70 6500
 f 403.000 10 60 70 6500
 f 403.200 10 60 70 6500
-f 403.500 10 60 70 6500
+f 403.500 10 60 70 7000
 ```
 
 **`/opt/dxlAPRS/setup/frequency_2.txt`** (SDR2)
 
 ```
-f 403.500 10 60 70 6500
+f 403.500 10 60 70 7000
 f 403.700 10 60 70 6500
 f 404.000 10 60 70 6500
 f 404.200 10 60 70 6500
@@ -549,10 +549,14 @@ sonde simultaneously, one at the current best width, one at a challenger width.
 A nightly-and-middday controller hill-climbs toward the optimum without operator
 involvement.
 
-Empirically, 6500 Hz decodes 2.3–15× more good frames than 12000 Hz across five
-paired passes (the advantage follows the width across a dongle swap, so it is the
-filter, not the receiver). The optimum may lie below 6500; the optimiser searches
-for it.
+**Status: converged at 7000 Hz (2026-06-06).** The controller ran a 6-flight
+search — `6500 → (5500 ✗) → 7000 ✓ → (7500 ✗) → 7000` — and locked both dongles
+at 7000 Hz. The decode-rate-vs-width curve has a broad flat top: 5500 lost
+decisively (p≈3e-81), 7500 lost at the step floor, and 7000 edged out 6500
+(p≈6e-11, after two statistical ties). The controller now no-ops on each run
+(`phase: converged`) and takes no further action until its state is reset. The
+earlier 6500-beats-12000 result still holds — 12000 is far off the peak; the true
+optimum is just slightly wider than 6500.
 
 ### Data flow
 
@@ -591,6 +595,9 @@ an off-frequency or signal-less flight simply holds.
 - Width is bounded to `BOUNDS` (3000–12000 Hz). The decode-rate-vs-width curve is
   unimodal (peak near the signal's occupied bandwidth), so a 1-D line search is
   sufficient — no local-minima handling needed.
+- After convergence the controller is dormant. To re-open the search (e.g. to
+  re-confirm or chase a finer step), reset `ab_controller_state.json` via `--init`
+  and set a fresh challenger; otherwise it holds the converged width indefinitely.
 
 ### Safety invariants
 
@@ -627,7 +634,9 @@ both 00:30 and 12:30 CEST, so each daily flight tests a fresh width:
 
 The width-rewrite preserves each line's terminator; otherwise the 403.500 entry
 fuses with the next channel (only visible on SDR2, whose 403.500 is not the last
-line).
+line). The decision logger writes to `ab_controller.log` directly and echoes to
+stdout only when interactive (`isatty`); under cron, stdout is redirected into
+that same file, so an unconditional echo would write every line twice.
 
 ### Schedule
 
