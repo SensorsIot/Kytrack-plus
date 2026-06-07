@@ -57,6 +57,16 @@ POLYCOM_RETRY_WAIT_SECONDS=${POLYCOM_RETRY_WAIT_SECONDS:-90}
 
 mkdir -p "$STATE_DIR"
 
+# Suppress the dxlAPRS watchdog while we hold the dongles. kycal tears down and
+# rebuilds the receiver chain to apply each new PPM; the watchdog would read the
+# missing sdrtst/sondeudp as a failure and "self-heal" (restart the chain under
+# us) plus alert. The watchdog skips its cycle whenever this file is present and
+# fresh, and ages it out as a crash-safety net so a killed kycal can't disable
+# the watchdog forever. Removed on any exit via the trap below.
+WATCHDOG_CAL_FILE=/var/tmp/.kytrack-watchdog-cal
+touch "$WATCHDOG_CAL_FILE"
+trap 'rm -f "$WATCHDOG_CAL_FILE"' EXIT
+
 if [ -f "$CONFIG" ]; then
     # shellcheck disable=SC1090
     . "$CONFIG"
