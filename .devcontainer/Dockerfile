@@ -1,4 +1,4 @@
-FROM mcr.microsoft.com/devcontainers/base:bookworm
+FROM mcr.microsoft.com/devcontainers/base:debian
 
 ARG USERNAME=dev
 ARG USER_UID=1000
@@ -24,17 +24,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         ripgrep \
     && rm -rf /var/lib/apt/lists/*
 
-# Base image ships a 'vscode' user at UID 1000; rename it to 'dev' (idempotent if already done)
-RUN if id -u dev >/dev/null 2>&1; then \
-        true; \
-    elif id -u vscode >/dev/null 2>&1; then \
-        groupmod -n dev vscode && \
-        usermod  -l dev -d /home/dev -m -s /bin/bash vscode && \
-        sed -i 's/^vscode /dev /' /etc/sudoers.d/* 2>/dev/null || true; \
-    else \
-        groupadd --gid $USER_GID dev && \
-        useradd --uid $USER_UID --gid $USER_GID -m -s /bin/bash dev; \
-    fi
+# Base image ships a 'vscode' user at UID 1000; rename it to 'dev' (keeps UID 1000)
+RUN usermod -l dev -d /home/dev -m vscode \
+    && groupmod -n dev vscode \
+    && sed -i 's/vscode/dev/g' /etc/sudoers.d/vscode || true \
+    && mv /etc/sudoers.d/vscode /etc/sudoers.d/dev 2>/dev/null || true
 
 WORKDIR /workspaces/kytrack
 RUN echo 'cd /workspaces/kytrack 2>/dev/null' >> /home/dev/.bashrc
