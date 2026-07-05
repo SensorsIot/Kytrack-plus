@@ -17,6 +17,7 @@
     },
     "forwardPorts": [2992],
     "appPort": ["2992:2222"],
+    "runArgs": ["--name", "kytrack"],
     "remoteUser": "dev",
     "containerUser": "dev",
     "mounts": [
